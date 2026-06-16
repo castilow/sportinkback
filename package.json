@@ -1,0 +1,13 @@
+{
+  "name": "sportink-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Backend de Sportink (API FastAPI del software de gestión de clubes)",
+  "scripts": {
+    "start": "bash start.sh",
+    "dev": "bash start.sh",
+    "setup": "python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt",
+    "serve": "./.venv/bin/uvicorn server:app --reload --port ${PORT:-8000}",
+    "stop": "lsof -ti tcp:${PORT:-8000} | xargs kill -9 || true"
+  }
+}
