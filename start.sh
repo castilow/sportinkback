@@ -1,8 +1,20 @@
 #!/usr/bin/env bash
-# Arranca el backend de Sportink en local.
+# Arranca el backend de Sportink. Sirve tanto en local como en Render.
 set -e
 cd "$(dirname "$0")"
 
+PORT="${PORT:-8000}"
+
+# ---------- Producción (Render) ----------
+# Render define la variable RENDER automáticamente, instala las dependencias
+# en el build y pasa las variables de entorno directamente (sin .env).
+# Lo único imprescindible: enlazar a 0.0.0.0 y al puerto $PORT.
+if [ -n "$RENDER" ]; then
+  echo "→ Arrancando API (producción) en 0.0.0.0:${PORT}"
+  exec uvicorn server:app --host 0.0.0.0 --port "${PORT}"
+fi
+
+# ---------- Desarrollo local ----------
 if [ ! -d ".venv" ]; then
   echo "→ Creando entorno virtual..."
   python3 -m venv .venv
@@ -17,14 +29,12 @@ if [ ! -f ".env" ]; then
   cp .env.example .env
 fi
 
-PORT="${PORT:-8000}"
-
-# Si el puerto está ocupado (proceso anterior), lo liberamos.
-if lsof -ti tcp:"${PORT}" >/dev/null 2>&1; then
+# Liberar el puerto si quedó ocupado por un proceso anterior.
+if command -v lsof >/dev/null 2>&1 && lsof -ti tcp:"${PORT}" >/dev/null 2>&1; then
   echo "→ Puerto ${PORT} ocupado, liberándolo..."
   lsof -ti tcp:"${PORT}" | xargs kill -9 2>/dev/null || true
   sleep 1
 fi
 
 echo "→ Arrancando API en http://localhost:${PORT}/api"
-uvicorn server:app --reload --port "${PORT}"
+exec uvicorn server:app --host 0.0.0.0 --port "${PORT}" --reload
