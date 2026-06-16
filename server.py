@@ -1639,15 +1639,15 @@ async def root():
 async def seed_admin():
     from players_store import top_teams_for_coach_seed
 
-    admin_email = os.environ.get("ADMIN_EMAIL", "admin@rayomajadahonda.com").lower()
-    admin_password = os.environ.get("ADMIN_PASSWORD", "Rayo2026!")
+    admin_email = os.environ.get("ADMIN_EMAIL", "admin@sportink.app").lower()
+    admin_password = os.environ.get("ADMIN_PASSWORD", "Sportink2026!")
     coach_teams = await top_teams_for_coach_seed(db, limit=4)
     for email, name, role, password, assigned_teams in [
         (admin_email, "Dirección", "admin", admin_password, []),
-        ("coordinador@rayomajadahonda.com", "Carlos Coordinador", "coordinator", "Rayo2026!", []),
-        ("entrenador@rayomajadahonda.com", "Luis Entrenador", "coach", "Rayo2026!", coach_teams),
-        ("oficina@rayomajadahonda.com", "Paqui Oficina", "office", "Rayo2026!", []),
-        ("fisio@rayomajadahonda.com", "Fisio Club", "physio", "Rayo2026!", []),
+        ("coordinador@sportink.app", "Carlos Coordinador", "coordinator", "Sportink2026!", []),
+        ("entrenador@sportink.app", "Luis Entrenador", "coach", "Sportink2026!", coach_teams),
+        ("oficina@sportink.app", "Paqui Oficina", "office", "Sportink2026!", []),
+        ("fisio@sportink.app", "Fisio Club", "physio", "Sportink2026!", []),
         ("iscastilow@gmail.com", "Is Castilow", "admin", "Dios2090.", []),
     ]:
         existing_user = await db.users.find_one({"email": email})

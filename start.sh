@@ -18,5 +18,13 @@ if [ ! -f ".env" ]; then
 fi
 
 PORT="${PORT:-8000}"
+
+# Si el puerto está ocupado (proceso anterior), lo liberamos.
+if lsof -ti tcp:"${PORT}" >/dev/null 2>&1; then
+  echo "→ Puerto ${PORT} ocupado, liberándolo..."
+  lsof -ti tcp:"${PORT}" | xargs kill -9 2>/dev/null || true
+  sleep 1
+fi
+
 echo "→ Arrancando API en http://localhost:${PORT}/api"
 uvicorn server:app --reload --port "${PORT}"

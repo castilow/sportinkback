@@ -417,6 +417,18 @@ class _PlayersFindCursor:
             cursor.sort(self._sort_key, self._sort_dir)
         return await cursor.to_list(length)
 
+    def __aiter__(self):
+        self._aiter = None
+        return self
+
+    async def __anext__(self):
+        if self._aiter is None:
+            self._aiter = iter(await self.to_list(None))
+        try:
+            return next(self._aiter)
+        except StopIteration:
+            raise StopAsyncIteration
+
 
 async def top_teams_for_coach_seed(db: Any, limit: int = 3) -> list[str]:
     """Equipos más poblados en SQL para asignar al entrenador demo."""
