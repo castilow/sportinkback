@@ -1431,9 +1431,11 @@ async def list_rffm_standings(team_id: Optional[str] = None, user=Depends(get_cu
 from routes import chat as _chat_routes  # noqa: E402
 from routes import sheets as _sheets_routes  # noqa: E402
 from routes import tickets as _tickets_routes  # noqa: E402
+from routes import branding as _branding_routes  # noqa: E402
 api_router.include_router(_chat_routes.router)
 api_router.include_router(_sheets_routes.router)
 api_router.include_router(_tickets_routes.router)
+api_router.include_router(_branding_routes.router)
 
 
 
