@@ -52,6 +52,8 @@ def sql_row_to_player(row: dict) -> dict:
         "birthdate": row.get("fecha_nacimiento"),
         "category": _category_label(row),
         "team": team,
+        "team_id": str(row["team_id"]) if row.get("team_id") else None,
+        "club_id": str(row["club_id"]) if row.get("club_id") else None,
         "entity": _entity_from_row(row),
         "payment_status": not has_debt,
         "insurance_expiry": None,
@@ -94,6 +96,8 @@ select
   p.categoria_abrv,
   p.categoria,
   p.equipo,
+  p.club_id::text as club_id,
+  p.team_id::text as team_id,
   p.notas,
   p.created_at::text as created_at,
   g.telefono,
@@ -159,6 +163,8 @@ def _app_doc_to_sql_fields(doc: dict) -> dict:
         "categoria": doc.get("category") or doc.get("team") or "Sin categoría",
         "categoria_abrv": None,
         "equipo": doc.get("team") or "",
+        "club_id": doc.get("club_id") or None,
+        "team_id": doc.get("team_id") or None,
         "notas": doc.get("notes") or "",
         "genero": "MASCULINO",
         "empadronado": True,
@@ -170,10 +176,13 @@ def _app_doc_to_sql_fields(doc: dict) -> dict:
 async def insert_sql_player(db: Any, doc: dict) -> dict:
     pid = doc.get("id") or str(uuid.uuid4())
     fields = _app_doc_to_sql_fields(doc)
+    club_sql = "null" if not fields["club_id"] else f"{_sql_literal(fields['club_id'])}::uuid"
+    team_sql = "null" if not fields["team_id"] else f"{_sql_literal(fields['team_id'])}::uuid"
     sql = f"""
     insert into public.players (
       id, nombres, apellidos, genero, dni, fecha_nacimiento,
-      categoria, equipo, situacion, empadronado, federado, notas, temporada
+      categoria, equipo, situacion, empadronado, federado, notas, temporada,
+      club_id, team_id
     ) values (
       {_sql_literal(pid)}::uuid,
       {_sql_literal(fields['nombres'])},
@@ -185,7 +194,9 @@ async def insert_sql_player(db: Any, doc: dict) -> dict:
       {_sql_literal(fields['equipo'])},
       'Con Plaza', true, false,
       {_sql_literal(fields['notas'])},
-      {_sql_literal(TEMPORADA)}
+      {_sql_literal(TEMPORADA)},
+      {club_sql},
+      {team_sql}
     );
     """
     await db.execute(sql)
@@ -203,6 +214,12 @@ async def insert_sql_player(db: Any, doc: dict) -> dict:
 
 async def update_sql_player(db: Any, player_id: str, doc: dict) -> Optional[dict]:
     fields = _app_doc_to_sql_fields(doc)
+    club_sql = "club_id" if not fields["club_id"] else f"{_sql_literal(fields['club_id'])}::uuid"
+    team_sql = "null" if not fields["team_id"] else f"{_sql_literal(fields['team_id'])}::uuid"
+    if fields["club_id"]:
+        club_assign = f"club_id = {_sql_literal(fields['club_id'])}::uuid,"
+    else:
+        club_assign = ""
     sql = f"""
     update public.players set
       nombres = {_sql_literal(fields['nombres'])},
@@ -211,6 +228,8 @@ async def update_sql_player(db: Any, player_id: str, doc: dict) -> Optional[dict
       fecha_nacimiento = {_sql_literal(fields['fecha_nacimiento'])}::date,
       categoria = {_sql_literal(fields['categoria'])},
       equipo = {_sql_literal(fields['equipo'])},
+      {club_assign}
+      team_id = {team_sql},
       notas = {_sql_literal(fields['notas'])},
       updated_at = now()
     where id = {_sql_literal(player_id)}::uuid;

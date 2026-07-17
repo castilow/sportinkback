@@ -192,9 +192,19 @@ def verify_password(pw: str, h: str) -> bool:
         return False
 
 
+def _cookie_secure() -> bool:
+    raw = (os.environ.get("COOKIE_SECURE") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return os.environ.get("ENV", os.environ.get("ENVIRONMENT", "")).lower() in ("production", "prod")
+
+
 def set_auth_cookies(response: Response, access: str, refresh: str):
-    response.set_cookie("access_token", access, httponly=True, secure=False, samesite="lax", max_age=43200, path="/")
-    response.set_cookie("refresh_token", refresh, httponly=True, secure=False, samesite="lax", max_age=604800, path="/")
+    secure = _cookie_secure()
+    response.set_cookie("access_token", access, httponly=True, secure=secure, samesite="lax", max_age=43200, path="/")
+    response.set_cookie("refresh_token", refresh, httponly=True, secure=secure, samesite="lax", max_age=604800, path="/")
 
 
 def clear_auth_cookies(response: Response):
@@ -214,8 +224,59 @@ def sign_in_with_supabase(email: str, password: str) -> dict:
     return resp.json()
 
 
+def sign_up_with_supabase(email: str, password: str, *, name: str = "") -> dict:
+    """Alta en Supabase Auth. La confirmación de correo depende de la config del proyecto."""
+    payload = {
+        "email": email.lower(),
+        "password": password,
+        "data": {"name": name},
+    }
+    resp = _supabase_public_request(
+        "POST",
+        "/auth/v1/signup",
+        json=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    if resp.status_code >= 300:
+        raise HTTPException(status_code=400, detail=_supabase_error_message(resp))
+    return resp.json()
+
+
+def resend_supabase_signup(email: str) -> None:
+    resp = _supabase_public_request(
+        "POST",
+        "/auth/v1/resend",
+        json={"type": "signup", "email": email.lower()},
+        headers={"Content-Type": "application/json"},
+    )
+    if resp.status_code >= 300 and resp.status_code != 422:
+        raise HTTPException(status_code=400, detail=_supabase_error_message(resp))
+
+
+def supabase_rpc(fn_name: str, payload: dict) -> dict:
+    """Ejecuta una RPC de Postgres vía PostgREST con service_role."""
+    resp = _supabase_admin_request(
+        "POST",
+        f"/rest/v1/rpc/{fn_name}",
+        json=payload,
+        headers={"Content-Type": "application/json", "Prefer": "return=representation"},
+    )
+    if resp.status_code >= 300:
+        raise HTTPException(status_code=400, detail=_supabase_error_message(resp))
+    data = resp.json()
+    if isinstance(data, list) and data:
+        return data[0] if isinstance(data[0], dict) else {"result": data[0]}
+    if isinstance(data, dict):
+        return data
+    return {"result": data}
+
+
 def sign_out_supabase(access_token: str):
-    resp = _supabase_public_request("POST", "/auth/v1/logout", bearer=access_token)
+    # scope=local: invalida SOLO la sesión de este token/pestaña.
+    # Sin esto, GoTrue usa scope=global por defecto y un logout en un
+    # dispositivo/pestaña cierra la sesión de ESE MISMO USUARIO en todos
+    # los demás dispositivos y pestañas donde tenga sesión abierta.
+    resp = _supabase_public_request("POST", "/auth/v1/logout?scope=local", bearer=access_token)
     if resp.status_code >= 300 and resp.status_code != 401:
         logger.warning(f"Supabase logout devolvió {resp.status_code}: {_supabase_error_message(resp)}")
 
@@ -244,33 +305,127 @@ def get_supabase_user(access_token: str) -> dict:
     return resp.json()
 
 
+def _auth_email_verified(auth_user: dict) -> bool:
+    if auth_user.get("email_confirmed_at"):
+        return True
+    # Usuarios creados por admin (seed) suelen venir ya confirmados
+    if auth_user.get("confirmed_at"):
+        return True
+    return False
+
+
+async def _fetch_profile_by_auth_id(auth_user_id: str) -> Optional[dict]:
+    """Lee public.profiles cuando existe la capa Postgres."""
+    if not hasattr(db, "fetch_json_rows"):
+        return None
+    try:
+        from postgres_compat import _sql_literal
+
+        rows = await db.fetch_json_rows(
+            f"""
+            select id::text as id, email, nombre as name, rol as role,
+                   coalesce(equipos_asignados, '{{}}') as assigned_teams,
+                   club_id::text as club_id,
+                   coalesce(onboarding_completed, false) as onboarding_completed,
+                   created_at::text as created_at
+            from public.profiles
+            where id = {_sql_literal(auth_user_id)}::uuid
+            limit 1;
+            """
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        teams = row.get("assigned_teams") or []
+        if isinstance(teams, str):
+            teams = [t for t in teams.strip("{}").split(",") if t]
+        return {
+            "id": row["id"],
+            "auth_user_id": auth_user_id,
+            "email": (row.get("email") or "").lower(),
+            "name": row.get("name") or row.get("email") or "",
+            "role": row.get("role"),
+            "assigned_teams": teams,
+            "club_id": row.get("club_id"),
+            "onboarding_completed": bool(row.get("onboarding_completed")),
+            "created_at": row.get("created_at"),
+        }
+    except Exception as exc:
+        logger.warning("No se pudo leer profiles: %s", exc)
+        return None
+
+
 async def resolve_app_user_from_token(access_token: str) -> dict:
+    """Resuelve el usuario de la app.
+
+    IMPORTANTE: no se confía en user_metadata.role del cliente.
+    El rol solo sale de profiles / app_documents.users provisionados por el servidor.
+    """
     auth_user = get_supabase_user(access_token)
     auth_user_id = auth_user.get("id")
     email = (auth_user.get("email") or "").lower()
-    user = await db.users.find_one({"auth_user_id": auth_user_id}, {"_id": 0, "password_hash": 0})
-    if not user and email:
-        user = await db.users.find_one({"email": email}, {"_id": 0, "password_hash": 0})
-        if user and user.get("auth_user_id") != auth_user_id:
-            await db.users.update_one({"id": user["id"]}, {"$set": {"auth_user_id": auth_user_id}})
-            user["auth_user_id"] = auth_user_id
+    email_verified = _auth_email_verified(auth_user)
+
+    profile = await _fetch_profile_by_auth_id(auth_user_id) if auth_user_id else None
+    user = None
+    if profile and profile.get("role"):
+        user = profile
+    else:
+        user = await db.users.find_one({"auth_user_id": auth_user_id}, {"_id": 0, "password_hash": 0})
+        if not user and email:
+            user = await db.users.find_one({"email": email}, {"_id": 0, "password_hash": 0})
+            if user and user.get("auth_user_id") != auth_user_id:
+                await db.users.update_one({"id": user["id"]}, {"$set": {"auth_user_id": auth_user_id}})
+                user["auth_user_id"] = auth_user_id
+
     if not user:
+        # Alta pública pendiente de onboarding: identidad mínima sin privilegios
         meta = auth_user.get("user_metadata") or {}
-        role = meta.get("role") or (auth_user.get("app_metadata") or {}).get("role")
-        if not role:
-            raise HTTPException(status_code=401, detail="Usuario no encontrado")
-        user = {
-            "id": meta.get("app_user_id") or auth_user_id,
+        return {
+            "id": auth_user_id,
             "auth_user_id": auth_user_id,
             "email": email,
             "name": meta.get("name") or email,
-            "role": role,
-            "assigned_teams": meta.get("assigned_teams") or [],
+            "role": "pending",
+            "assigned_teams": [],
+            "club_id": None,
+            "email_verified": email_verified,
+            "onboarding_completed": False,
             "created_at": now_iso(),
         }
-        await db.users.insert_one(user)
+
     user.pop("password_hash", None)
+    user["auth_user_id"] = auth_user_id or user.get("auth_user_id")
+    user["email_verified"] = email_verified
+    user.setdefault("club_id", None)
+    user.setdefault("assigned_teams", user.get("assigned_teams") or [])
+
+    # Staff legacy (app_documents) sin club: asignar el club por defecto
+    if not user.get("club_id") and user.get("role") in ("admin", "coordinator", "coach", "office", "physio"):
+        default_club = await _fetch_default_club_id()
+        if default_club:
+            user["club_id"] = default_club
+            user["onboarding_completed"] = True
+
+    user.setdefault("onboarding_completed", bool(user.get("club_id")))
     return user
+
+
+async def _fetch_default_club_id() -> Optional[str]:
+    if not hasattr(db, "fetch_json_rows"):
+        return None
+    try:
+        rows = await db.fetch_json_rows(
+            """
+            select id::text as id from public.clubs
+            where is_default = true or slug = 'rayo-majadahonda'
+            order by is_default desc
+            limit 1;
+            """
+        )
+        return rows[0]["id"] if rows else None
+    except Exception:
+        return None
 
 
 async def get_current_user(request: Request) -> dict:
@@ -289,11 +444,21 @@ async def get_user_from_request_values(request: Optional[Request] = None, author
 
 def require_roles(*allowed):
     async def _dep(user: dict = Depends(get_current_user)):
+        if user.get("role") == "pending":
+            raise HTTPException(status_code=403, detail="Completa el registro del club para continuar")
         if user.get("role") not in allowed:
             raise HTTPException(status_code=403, detail="Permiso denegado")
         return user
 
     return _dep
+
+
+def require_club_context(user: dict) -> str:
+    """Exige club_id en el usuario autenticado."""
+    club_id = user.get("club_id")
+    if not club_id:
+        raise HTTPException(status_code=403, detail="Tu cuenta no tiene club asignado. Completa el onboarding.")
+    return club_id
 
 
 def supabase_admin_list_users() -> list[dict]:
@@ -422,10 +587,14 @@ __all__ = [
     "set_auth_cookies",
     "clear_auth_cookies",
     "sign_in_with_supabase",
+    "sign_up_with_supabase",
     "sign_out_supabase",
+    "resend_supabase_signup",
+    "supabase_rpc",
     "get_current_user",
     "get_user_from_request_values",
     "require_roles",
+    "require_club_context",
     "ensure_supabase_staff_user",
     "delete_supabase_auth_user",
     "create_parent_chat_session",

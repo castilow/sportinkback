@@ -441,14 +441,26 @@ class PostgresCompatDB:
                 for row in data:
                     if not isinstance(row, dict):
                         continue
+                    # Algunas consultas envuelven el resultado en una sola columna JSON.
+                    # Si solo hay una columna string, intentar parsearla; si no es JSON,
+                    # conservar la fila tal cual (p. ej. select id::text).
                     if len(row) == 1:
                         val = next(iter(row.values()))
-                        if isinstance(val, str):
-                            rows.append(json.loads(val))
-                        elif isinstance(val, dict):
+                        if isinstance(val, dict):
                             rows.append(val)
-                    else:
-                        rows.append(row)
+                            continue
+                        if isinstance(val, str):
+                            try:
+                                parsed = json.loads(val)
+                                if isinstance(parsed, dict):
+                                    rows.append(parsed)
+                                    continue
+                                if isinstance(parsed, list):
+                                    rows.extend([r for r in parsed if isinstance(r, dict)])
+                                    continue
+                            except Exception:
+                                pass
+                    rows.append(row)
                 return rows
         output = await self.execute(sql)
         if not output:

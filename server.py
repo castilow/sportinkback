@@ -27,7 +27,8 @@ from deps import (
     now_iso, rate_limit_ip,
     init_storage, put_object, get_object,
     set_auth_cookies, clear_auth_cookies, sign_in_with_supabase, sign_out_supabase,
-    get_current_user, require_roles,
+    get_current_user, require_roles, require_club_context,
+    resolve_app_user_from_token,
     ensure_supabase_staff_user, delete_supabase_auth_user,
 )
 
@@ -81,6 +82,7 @@ class PlayerIn(BaseModel):
     birthdate: Optional[str] = None  # ISO date
     category: str
     team: str = ""
+    team_id: Optional[str] = None
     entity: Literal["club", "fundacion"] = "club"
     payment_status: bool = True  # True = al día
     insurance_expiry: Optional[str] = None  # ISO date
@@ -302,23 +304,47 @@ async def login(data: LoginIn, request: Request, response: Response):
         raise HTTPException(status_code=401, detail="Credenciales inválidas")
 
     auth_user = session.get("user") or {}
-    user = await db.users.find_one({"auth_user_id": auth_user.get("id")}, {"_id": 0, "password_hash": 0})
-    if not user:
-        user = await db.users.find_one({"email": email}, {"_id": 0, "password_hash": 0})
-        if user and user.get("auth_user_id") != auth_user.get("id"):
-            await db.users.update_one({"id": user["id"]}, {"$set": {"auth_user_id": auth_user.get("id")}})
-            user["auth_user_id"] = auth_user.get("id")
-    if not user:
+    set_auth_cookies(response, session["access_token"], session["refresh_token"])
+
+    # Resolver identidad (profiles SQL o app_documents). Permite altas públicas
+    # que solo existen en public.profiles, y cuentas pending de onboarding.
+    try:
+        enriched = await resolve_app_user_from_token(session["access_token"])
+    except HTTPException:
         await _register_failed_login(identifier)
         await _register_failed_login(email_identifier)
+        clear_auth_cookies(response)
+        raise
+
+    if not enriched or not enriched.get("role"):
+        await _register_failed_login(identifier)
+        await _register_failed_login(email_identifier)
+        clear_auth_cookies(response)
         raise HTTPException(status_code=401, detail="Usuario no autorizado en esta aplicación")
+
+    # Sincronizar documento legacy users para compatibilidad
+    if enriched.get("role") != "pending":
+        existing = await db.users.find_one({"email": email}, {"_id": 0})
+        if not existing:
+            await db.users.insert_one({
+                "id": enriched.get("id") or auth_user.get("id"),
+                "auth_user_id": auth_user.get("id"),
+                "email": email,
+                "name": enriched.get("name") or email,
+                "role": enriched.get("role"),
+                "assigned_teams": enriched.get("assigned_teams") or [],
+                "club_id": enriched.get("club_id"),
+                "created_at": now_iso(),
+            })
+        elif existing.get("auth_user_id") != auth_user.get("id"):
+            await db.users.update_one(
+                {"id": existing["id"]},
+                {"$set": {"auth_user_id": auth_user.get("id"), "club_id": enriched.get("club_id")}},
+            )
 
     await _clear_login_attempts(identifier)
     await _clear_login_attempts(email_identifier)
-    set_auth_cookies(response, session["access_token"], session["refresh_token"])
-    user.pop("_id", None)
-    user.pop("password_hash", None)
-    return user
+    return enriched
 
 
 @api_router.post("/auth/logout")
@@ -388,20 +414,64 @@ async def delete_user(user_id: str, user=Depends(require_roles("admin"))):
 
 
 # ------------------ Players CRUD ------------------
+async def _resolve_team_name(club_id: str, team_id: Optional[str], team_name: str) -> tuple[Optional[str], str]:
+    """Devuelve (team_id, team_name) validado dentro del club."""
+    if not hasattr(db, "fetch_json_rows"):
+        return team_id, team_name
+    from postgres_compat import _sql_literal
+
+    if team_id:
+        rows = await db.fetch_json_rows(
+            f"""
+            select id::text as id, nombre
+            from public.teams
+            where id = {_sql_literal(team_id)}::uuid
+              and club_id = {_sql_literal(club_id)}::uuid
+              and activo = true
+            limit 1;
+            """
+        )
+        if not rows:
+            raise HTTPException(status_code=400, detail="Equipo no válido para tu club")
+        return rows[0]["id"], rows[0]["nombre"]
+    if team_name:
+        rows = await db.fetch_json_rows(
+            f"""
+            select id::text as id, nombre
+            from public.teams
+            where club_id = {_sql_literal(club_id)}::uuid
+              and lower(nombre) = lower({_sql_literal(team_name.strip())})
+              and activo = true
+            limit 1;
+            """
+        )
+        if rows:
+            return rows[0]["id"], rows[0]["nombre"]
+    return None, team_name
+
+
 @api_router.get("/players")
 async def list_players(
     category: Optional[str] = None,
     team: Optional[str] = None,
+    team_id: Optional[str] = None,
     search: Optional[str] = None,
     entity: Optional[str] = None,
     attention: Optional[bool] = None,
     user=Depends(get_current_user),
 ):
+    if user.get("role") == "pending":
+        return []
+    club_id = user.get("club_id")
     query = {}
+    if club_id:
+        query["club_id"] = club_id
     if category:
         query["category"] = category
     if team:
         query["team"] = team
+    if team_id:
+        query["team_id"] = team_id
     # Coaches only see their assigned teams (equipo o categoría del SQL)
     coach_allowed: Optional[set] = None
     if user.get("role") == "coach":
@@ -412,6 +482,8 @@ async def list_players(
         if team and team not in coach_allowed:
             return []
     players = await db.players.find(query, {"_id": 0}).sort("name", 1).to_list(2000)
+    if club_id:
+        players = [p for p in players if not p.get("club_id") or p.get("club_id") == club_id]
     if coach_allowed is not None:
         players = [
             p for p in players
@@ -437,7 +509,12 @@ async def list_players(
 
 @api_router.post("/players")
 async def create_player(data: PlayerIn, user=Depends(require_roles("admin", "coordinator"))):
+    club_id = require_club_context(user)
     doc = data.model_dump()
+    resolved_team_id, resolved_team = await _resolve_team_name(club_id, doc.get("team_id"), doc.get("team") or "")
+    doc["team_id"] = resolved_team_id
+    doc["team"] = resolved_team
+    doc["club_id"] = club_id
     doc["id"] = str(uuid.uuid4())
     doc["created_at"] = now_iso()
     await db.players.insert_one(doc)
@@ -447,7 +524,17 @@ async def create_player(data: PlayerIn, user=Depends(require_roles("admin", "coo
 
 @api_router.put("/players/{player_id}")
 async def update_player(player_id: str, data: PlayerIn, user=Depends(require_roles("admin", "coordinator"))):
+    club_id = require_club_context(user)
+    existing = await db.players.find_one({"id": player_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Jugador no encontrado")
+    if existing.get("club_id") and existing.get("club_id") != club_id:
+        raise HTTPException(status_code=403, detail="No puedes modificar jugadores de otro club")
     doc = data.model_dump()
+    resolved_team_id, resolved_team = await _resolve_team_name(club_id, doc.get("team_id"), doc.get("team") or "")
+    doc["team_id"] = resolved_team_id
+    doc["team"] = resolved_team
+    doc["club_id"] = club_id
     result = await db.players.update_one({"id": player_id}, {"$set": doc})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Jugador no encontrado")
@@ -457,6 +544,12 @@ async def update_player(player_id: str, data: PlayerIn, user=Depends(require_rol
 
 @api_router.delete("/players/{player_id}")
 async def delete_player(player_id: str, user=Depends(require_roles("admin"))):
+    club_id = require_club_context(user)
+    existing = await db.players.find_one({"id": player_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Jugador no encontrado")
+    if existing.get("club_id") and existing.get("club_id") != club_id:
+        raise HTTPException(status_code=403, detail="No puedes borrar jugadores de otro club")
     await db.players.delete_one({"id": player_id})
     return {"ok": True}
 
@@ -1432,10 +1525,14 @@ from routes import chat as _chat_routes  # noqa: E402
 from routes import sheets as _sheets_routes  # noqa: E402
 from routes import tickets as _tickets_routes  # noqa: E402
 from routes import branding as _branding_routes  # noqa: E402
+from routes import registration as _registration_routes  # noqa: E402
+from routes import clubs as _clubs_routes  # noqa: E402
 api_router.include_router(_chat_routes.router)
 api_router.include_router(_sheets_routes.router)
 api_router.include_router(_tickets_routes.router)
 api_router.include_router(_branding_routes.router)
+api_router.include_router(_registration_routes.router)
+api_router.include_router(_clubs_routes.router)
 
 
 
@@ -1568,7 +1665,12 @@ async def resolve_incident(incident_id: str, user=Depends(require_roles("admin")
 # ------------------ Dashboard stats ------------------
 @api_router.get("/dashboard/stats")
 async def dashboard_stats(user=Depends(get_current_user)):
-    players = await db.players.find({}, {"_id": 0}).to_list(5000)
+    query = {}
+    if user.get("club_id"):
+        query["club_id"] = user["club_id"]
+    players = await db.players.find(query, {"_id": 0}).to_list(5000)
+    if user.get("club_id"):
+        players = [p for p in players if not p.get("club_id") or p.get("club_id") == user["club_id"]]
     total = len(players)
     morosos = sum(1 for p in players if not p.get("payment_status"))
     attention_count = sum(1 for p in players if player_has_attention(p))
