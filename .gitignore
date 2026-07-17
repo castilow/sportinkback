@@ -13,3 +13,5 @@ __pycache__/
 
 # Logs
 *.log
+.temp/
+supabase/.temp/
