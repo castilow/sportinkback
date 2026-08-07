@@ -27,6 +27,7 @@ from deps import (
     now_iso, rate_limit_ip,
     init_storage, put_object, get_object,
     set_auth_cookies, clear_auth_cookies, sign_in_with_supabase, sign_out_supabase,
+    change_own_password,
     get_current_user, require_roles, require_club_context,
     resolve_app_user_from_token,
     ensure_supabase_staff_user, delete_supabase_auth_user,
@@ -137,6 +138,9 @@ class InventoryItemIn(BaseModel):
     assigned_to_team: str = ""
     assigned_to_user_id: str = ""
     status: str = "ok"
+    category: str = "material"  # material | ropa
+    sku: str = ""  # código de prenda (camiseta, sudadera...)
+    size: str = ""
 
 
 class InventoryConfirmIn(BaseModel):
@@ -144,8 +148,54 @@ class InventoryConfirmIn(BaseModel):
     notes: str = ""
 
 
+class InventoryUpdateIn(BaseModel):
+    item: Optional[str] = None
+    quantity: Optional[int] = None
+    assigned_to_team: Optional[str] = None
+    status: Optional[str] = None
+    category: Optional[str] = None
+    sku: Optional[str] = None
+    size: Optional[str] = None
+
+
+class PaymentConceptIn(BaseModel):
+    concept: Literal["matricula", "mensualidad", "ropa"]
+    amount: float = 0
+    status: Literal["pagado", "por_pagar", "becado"] = "por_pagar"
+    method: Literal["efectivo", "tarjeta", "transferencia", ""] = ""
+    paid_at: Optional[str] = None
+    notes: str = ""
+
+
+class PlayerBillingIn(BaseModel):
+    scholarship: bool = False
+    scholarship_pct: float = 0
+    scholarship_notes: str = ""
+    payments: List[PaymentConceptIn] = Field(default_factory=list)
+
+
 class OfficePlayerUpdateIn(BaseModel):
     payment_status: Optional[bool] = None
+    scholarship: Optional[bool] = None
+    scholarship_pct: Optional[float] = None
+    scholarship_notes: Optional[str] = None
+    billing: Optional[PlayerBillingIn] = None
+
+
+class PlayerRegistrationIn(BaseModel):
+    name: str
+    dni: str = ""
+    birthdate: Optional[str] = None
+    category: str
+    team: str = ""
+    entity: Literal["club", "fundacion"] = "club"
+    phone: str = ""
+    email: str = ""
+    notes: str = ""
+    scholarship: bool = False
+    scholarship_pct: float = 0
+    scholarship_notes: str = ""
+    payments: List[PaymentConceptIn] = Field(default_factory=list)
 
 
 class PlayerKitItemIn(BaseModel):
@@ -200,6 +250,27 @@ def semaforo_for_expiry(expiry_iso: Optional[str]) -> str:
 def enrich_player(p: dict) -> dict:
     p.pop("_id", None)
     p["entity"] = p.get("entity") or "club"
+    billing = p.get("billing")
+    if not billing:
+        billing = default_billing(
+            scholarship=bool(p.get("scholarship")),
+            scholarship_pct=float(p.get("scholarship_pct") or 0),
+            scholarship_notes=p.get("scholarship_notes") or "",
+        )
+        # Si solo había payment_status histórico, respétalo en matrícula
+        if p.get("payment_status") is True:
+            for pay in billing["payments"]:
+                pay["status"] = "pagado"
+            billing["pending_concepts"] = []
+            billing["pending_amount"] = 0
+            billing["all_paid"] = True
+        elif p.get("payment_status") is False:
+            billing["all_paid"] = False
+    p["billing"] = billing
+    p["scholarship"] = bool(billing.get("scholarship"))
+    p["scholarship_pct"] = billing.get("scholarship_pct", 0)
+    p["scholarship_notes"] = billing.get("scholarship_notes", "")
+    p["payment_status"] = bool(billing.get("all_paid", p.get("payment_status")))
     p["payment_semaforo"] = "green" if p.get("payment_status") else "red"
     if "insurance_semaforo" not in p:
         p["insurance_semaforo"] = semaforo_for_expiry(p.get("insurance_expiry"))
@@ -236,6 +307,95 @@ def summarize_kit_items(items: List[dict]) -> dict:
         "pending_items": pending,
         "issue_items": incidents,
     }
+
+
+DEFAULT_BILLING_CONCEPTS = ("matricula", "mensualidad", "ropa")
+
+
+def default_billing(payments: Optional[List[dict]] = None, scholarship: bool = False, scholarship_pct: float = 0, scholarship_notes: str = "") -> dict:
+    by_concept = {p.get("concept"): p for p in (payments or []) if p.get("concept")}
+    normalized = []
+    for concept in DEFAULT_BILLING_CONCEPTS:
+        current = by_concept.get(concept) or {}
+        status = current.get("status") or ("becado" if scholarship else "por_pagar")
+        method = current.get("method") or ""
+        if status != "pagado":
+            method = method if status == "becado" else (method or "")
+        normalized.append({
+            "concept": concept,
+            "amount": float(current.get("amount") or 0),
+            "status": status,
+            "method": method if status == "pagado" else ("" if status != "becado" else method),
+            "paid_at": current.get("paid_at"),
+            "notes": current.get("notes") or "",
+        })
+    pending = [p for p in normalized if p["status"] == "por_pagar"]
+    return {
+        "scholarship": bool(scholarship),
+        "scholarship_pct": float(scholarship_pct or 0),
+        "scholarship_notes": scholarship_notes or "",
+        "payments": normalized,
+        "pending_concepts": [p["concept"] for p in pending],
+        "pending_amount": round(sum(p["amount"] for p in pending), 2),
+        "all_paid": len(pending) == 0,
+    }
+
+
+def apply_billing_to_player(player: dict, billing: dict) -> dict:
+    out = dict(player)
+    out["billing"] = billing
+    out["scholarship"] = billing.get("scholarship", False)
+    out["scholarship_pct"] = billing.get("scholarship_pct", 0)
+    out["scholarship_notes"] = billing.get("scholarship_notes", "")
+    out["payment_status"] = bool(billing.get("all_paid"))
+    return out
+
+
+def stock_priority(quantity: int) -> str:
+    """Semáforo de stock ropa: <20 alta, <70 media, >=70 baja (umbrales provisionales)."""
+    qty = int(quantity or 0)
+    if qty < 20:
+        return "high"
+    if qty < 70:
+        return "medium"
+    return "low"
+
+
+async def deduct_inventory_for_kit_delivery(previous_items: List[dict], next_items: List[dict]):
+    """Descuenta stock de ropa al pasar prendas a 'entregado'."""
+    prev_map = {item.get("code"): item for item in (previous_items or [])}
+    for item in next_items or []:
+        code = item.get("code")
+        if not code or item.get("status") != "entregado":
+            continue
+        prev = prev_map.get(code) or {}
+        if prev.get("status") == "entregado":
+            continue
+        qty = max(1, int(item.get("quantity") or 1))
+        size = (item.get("size") or "").strip()
+        candidates = await db.inventory.find(
+            {"category": "ropa", "sku": code},
+            {"_id": 0},
+        ).to_list(50)
+        if size:
+            sized = [c for c in candidates if (c.get("size") or "").strip().lower() == size.lower()]
+            if sized:
+                candidates = sized
+        if not candidates:
+            # Fallback: match by item name containing label
+            label = (item.get("label") or code).lower()
+            candidates = [
+                c for c in await db.inventory.find({"category": "ropa"}, {"_id": 0}).to_list(200)
+                if label in (c.get("item") or "").lower() or code in (c.get("item") or "").lower()
+            ]
+        if not candidates:
+            continue
+        target = sorted(candidates, key=lambda c: int(c.get("quantity") or 0), reverse=True)[0]
+        new_qty = max(0, int(target.get("quantity") or 0) - qty)
+        await db.inventory.update_one(
+            {"id": target["id"]},
+            {"$set": {"quantity": new_qty, "updated_at": now_iso()}},
+        )
 
 
 # ------------------ Auth endpoints ------------------
@@ -359,6 +519,20 @@ async def logout(request: Request, response: Response):
 @api_router.get("/auth/me")
 async def me(user: dict = Depends(get_current_user)):
     return user
+
+
+class ChangePasswordIn(BaseModel):
+    new_password: str = Field(min_length=8, max_length=200)
+
+
+@api_router.post("/auth/change-password")
+async def change_password(data: ChangePasswordIn, request: Request, user: dict = Depends(get_current_user)):
+    """Ajustes de cuenta: el propio usuario cambia SU contraseña (no la de otros)."""
+    token = request.cookies.get("access_token")
+    if not token:
+        raise HTTPException(status_code=401, detail="No autenticado")
+    change_own_password(token, data.new_password)
+    return {"ok": True}
 
 
 # ------------------ User management (admin) ------------------
@@ -560,13 +734,101 @@ async def update_player_office(player_id: str, data: OfficePlayerUpdateIn, user=
     if not player:
         raise HTTPException(status_code=404, detail="Jugador no encontrado")
     update = {}
-    if data.payment_status is not None:
-        update["payment_status"] = data.payment_status
+    if data.billing is not None:
+        billing = default_billing(
+            payments=[p.model_dump() for p in data.billing.payments],
+            scholarship=data.billing.scholarship,
+            scholarship_pct=data.billing.scholarship_pct,
+            scholarship_notes=data.billing.scholarship_notes,
+        )
+        update.update({
+            "billing": billing,
+            "scholarship": billing["scholarship"],
+            "scholarship_pct": billing["scholarship_pct"],
+            "scholarship_notes": billing["scholarship_notes"],
+            "payment_status": billing["all_paid"],
+        })
+    else:
+        if data.payment_status is not None:
+            update["payment_status"] = data.payment_status
+        if data.scholarship is not None:
+            update["scholarship"] = data.scholarship
+        if data.scholarship_pct is not None:
+            update["scholarship_pct"] = data.scholarship_pct
+        if data.scholarship_notes is not None:
+            update["scholarship_notes"] = data.scholarship_notes
+        if any(k in update for k in ("scholarship", "scholarship_pct", "scholarship_notes", "payment_status")):
+            current = player.get("billing") or default_billing(
+                scholarship=bool(player.get("scholarship")),
+                scholarship_pct=float(player.get("scholarship_pct") or 0),
+                scholarship_notes=player.get("scholarship_notes") or "",
+            )
+            if data.payment_status is True:
+                for pay in current["payments"]:
+                    pay["status"] = "pagado"
+            elif data.payment_status is False:
+                for pay in current["payments"]:
+                    if pay["status"] == "pagado":
+                        pay["status"] = "por_pagar"
+            billing = default_billing(
+                payments=current["payments"],
+                scholarship=update.get("scholarship", current.get("scholarship")),
+                scholarship_pct=update.get("scholarship_pct", current.get("scholarship_pct")),
+                scholarship_notes=update.get("scholarship_notes", current.get("scholarship_notes")),
+            )
+            update.update({
+                "billing": billing,
+                "scholarship": billing["scholarship"],
+                "scholarship_pct": billing["scholarship_pct"],
+                "scholarship_notes": billing["scholarship_notes"],
+                "payment_status": billing["all_paid"],
+            })
     if not update:
         raise HTTPException(status_code=400, detail="No hay cambios para aplicar")
     await db.players.update_one({"id": player_id}, {"$set": update})
     updated = await db.players.find_one({"id": player_id}, {"_id": 0})
     return enrich_player(updated)
+
+
+@api_router.post("/players/register")
+async def register_player_office(data: PlayerRegistrationIn, user=Depends(require_roles("admin", "coordinator", "office"))):
+    """Alta de jugador desde Oficina con cobros de matrícula, mensualidad y ropa."""
+    billing = default_billing(
+        payments=[p.model_dump() for p in data.payments],
+        scholarship=data.scholarship,
+        scholarship_pct=data.scholarship_pct,
+        scholarship_notes=data.scholarship_notes,
+    )
+    doc = {
+        "id": str(uuid.uuid4()),
+        "name": data.name.strip(),
+        "dni": data.dni.strip(),
+        "birthdate": data.birthdate,
+        "category": data.category,
+        "team": data.team,
+        "entity": data.entity,
+        "phone": data.phone,
+        "email": data.email,
+        "notes": data.notes,
+        "billing": billing,
+        "scholarship": billing["scholarship"],
+        "scholarship_pct": billing["scholarship_pct"],
+        "scholarship_notes": billing["scholarship_notes"],
+        "payment_status": billing["all_paid"],
+        "insurance_expiry": None,
+        "dni_expiry": None,
+        "created_at": now_iso(),
+        "created_by": user["id"],
+        "created_by_role": user.get("role"),
+    }
+    try:
+        club_id = user.get("club_id")
+        if club_id:
+            doc["club_id"] = club_id
+    except Exception:
+        pass
+    await db.players.insert_one(doc)
+    return enrich_player(doc)
 
 
 # ------------------ Import Excel/CSV ------------------
@@ -852,6 +1114,95 @@ async def list_attendance(team: Optional[str] = None, user=Depends(get_current_u
     if team:
         q["team"] = team
     return await db.attendance.find(q, {"_id": 0}).sort("date", -1).to_list(500)
+
+
+@api_router.get("/attendance/report")
+async def attendance_report(
+    period: Literal["week", "month"] = "week",
+    team: Optional[str] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    user=Depends(require_roles("admin", "coordinator")),
+):
+    """Informe semanal/mensual de asistencia por equipo."""
+    today = date.today()
+    if from_date and to_date:
+        start = date.fromisoformat(from_date)
+        end = date.fromisoformat(to_date)
+    elif period == "month":
+        start = today.replace(day=1)
+        end = today
+    else:
+        start = today - timedelta(days=today.weekday())
+        end = today
+
+    sessions = await db.attendance.find({}, {"_id": 0}).sort("date", -1).to_list(2000)
+    filtered = []
+    for session in sessions:
+        try:
+            session_date = date.fromisoformat(str(session.get("date"))[:10])
+        except Exception:
+            continue
+        if session_date < start or session_date > end:
+            continue
+        if team and session.get("team") != team:
+            continue
+        filtered.append(session)
+
+    players = await db.players.find({}, {"_id": 0, "id": 1, "name": 1}).to_list(5000)
+    names = {p["id"]: p.get("name", p["id"]) for p in players}
+
+    by_team: dict = {}
+    for session in filtered:
+        team_name = session.get("team") or "Sin equipo"
+        bucket = by_team.setdefault(team_name, {
+            "team": team_name,
+            "sessions": 0,
+            "present_total": 0,
+            "records_total": 0,
+            "players": {},
+        })
+        bucket["sessions"] += 1
+        for record in session.get("records") or []:
+            pid = record.get("player_id")
+            if not pid:
+                continue
+            present = bool(record.get("present"))
+            bucket["records_total"] += 1
+            if present:
+                bucket["present_total"] += 1
+            player_row = bucket["players"].setdefault(pid, {
+                "player_id": pid,
+                "name": names.get(pid, pid),
+                "present": 0,
+                "total": 0,
+            })
+            player_row["total"] += 1
+            if present:
+                player_row["present"] += 1
+
+    teams_out = []
+    for team_name, bucket in sorted(by_team.items(), key=lambda x: x[0]):
+        players_out = []
+        for player_row in bucket["players"].values():
+            total = player_row["total"] or 1
+            players_out.append({
+                **player_row,
+                "pct": round((player_row["present"] / total) * 100),
+            })
+        players_out.sort(key=lambda x: (-x["pct"], x["name"]))
+        avg_pct = round((bucket["present_total"] / bucket["records_total"]) * 100) if bucket["records_total"] else 0
+        teams_out.append({
+            "team": team_name,
+            "sessions": bucket["sessions"],
+            "avg_pct": avg_pct,
+            "players": players_out,
+        })
+
+    return {
+        "period": {"type": period, "from": start.isoformat(), "to": end.isoformat()},
+        "teams": teams_out,
+    }
 
 
 # ------------------ Minutes (coach) ------------------
@@ -1542,18 +1893,40 @@ async def list_inventory(user=Depends(get_current_user)):
     q = {}
     if user["role"] == "coach":
         q["$or"] = [{"assigned_to_user_id": user["id"]}, {"assigned_to_team": {"$in": user.get("assigned_teams", [])}}]
-    return await db.inventory.find(q, {"_id": 0}).sort("item", 1).to_list(500)
+    items = await db.inventory.find(q, {"_id": 0}).sort("item", 1).to_list(500)
+    for item in items:
+        item["stock_priority"] = stock_priority(item.get("quantity") or 0)
+    return items
 
 
 @api_router.post("/inventory")
-async def create_inventory(data: InventoryItemIn, user=Depends(require_roles("admin"))):
+async def create_inventory(data: InventoryItemIn, user=Depends(require_roles("admin", "office", "coordinator"))):
     doc = data.model_dump()
     doc["id"] = str(uuid.uuid4())
     doc["created_at"] = now_iso()
+    doc["updated_at"] = now_iso()
     doc["confirmations"] = []
+    doc["stock_priority"] = stock_priority(doc.get("quantity") or 0)
     await db.inventory.insert_one(doc)
     doc.pop("_id", None)
     return doc
+
+
+@api_router.put("/inventory/{item_id}")
+async def update_inventory(item_id: str, data: InventoryUpdateIn, user=Depends(require_roles("admin", "office", "coordinator"))):
+    existing = await db.inventory.find_one({"id": item_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Item no encontrado")
+    update = {k: v for k, v in data.model_dump().items() if v is not None}
+    if not update:
+        raise HTTPException(status_code=400, detail="No hay cambios")
+    update["updated_at"] = now_iso()
+    if "quantity" in update:
+        update["stock_priority"] = stock_priority(update["quantity"])
+    await db.inventory.update_one({"id": item_id}, {"$set": update})
+    saved = await db.inventory.find_one({"id": item_id}, {"_id": 0})
+    saved["stock_priority"] = stock_priority(saved.get("quantity") or 0)
+    return saved
 
 
 @api_router.post("/inventory/{item_id}/confirm")
@@ -1609,6 +1982,8 @@ async def upsert_player_kit(player_id: str, data: PlayerKitIn, user=Depends(requ
         raise HTTPException(status_code=404, detail="Jugador no encontrado")
     existing = await db.player_kits.find_one({"player_id": player_id, "season": data.season}, {"_id": 0})
     items = [item.model_dump() for item in data.items]
+    previous_items = (existing or {}).get("items") or []
+    await deduct_inventory_for_kit_delivery(previous_items, items)
     summary = summarize_kit_items(items)
     doc = {
         "player_id": player_id,
@@ -1702,17 +2077,31 @@ async def dashboard_stats(user=Depends(get_current_user)):
     injuries_duda = sum(1 for c in injury_cases if c.get("status") == "Duda" and not c.get("closed_at"))
     injuries_open = injuries_baja + injuries_duda
 
-    # Mock "hours saved" — ~0.12h per player per week as administrative savings
+    # Estimación de horas administrativas ahorradas (no es una medición real,
+    # es una regla de negocio orientativa: ~0.12h/jugador/semana). Se marca
+    # como "estimated" para que el frontend lo muestre como estimación.
     hours_saved = round(total * 0.12 * 4, 1)
 
-    # Next match (mock)
-    next_match = {
-        "opponent": "CD Leganés B",
-        "date": (today + timedelta(days=(5 - today.weekday()) % 7 or 7)).isoformat(),
-        "time": "12:00",
-        "venue": "Cerro del Espino",
-        "category": "Juvenil A",
-    }
+    # Próximo partido: el primero sin jugar de los calendarios RFFM ya
+    # sincronizados (rffm_matches), no un dato inventado. Si el club todavía
+    # no sincronizó ningún calendario, devolvemos null en vez de un rival falso.
+    next_match = None
+    _best_date = None
+    for m in await db.rffm_matches.find({}, {"_id": 0}).to_list(2000):
+        if m.get("played"):
+            continue
+        iso = parse_date_val(m.get("match_date"))
+        if not iso or iso < today.isoformat():
+            continue
+        if _best_date is None or iso < _best_date:
+            _best_date = iso
+            next_match = {
+                "opponent": m.get("opponent") or "Rival por confirmar",
+                "date": iso,
+                "time": m.get("match_time") or "",
+                "venue": m.get("official_field") or m.get("venue") or "",
+                "category": m.get("team_name") or "",
+            }
 
     return {
         "total_players": total,
@@ -1730,6 +2119,7 @@ async def dashboard_stats(user=Depends(get_current_user)):
         "injuries_duda": injuries_duda,
         "injuries_open": injuries_open,
         "hours_saved": hours_saved,
+        "hours_saved_estimated": True,
         "next_match": next_match,
     }
 
@@ -1931,15 +2321,77 @@ async def seed_demo_players():
 async def seed_demo_inventory():
     if await db.inventory.count_documents({}) > 0:
         return
-    items = [
-        {"item": "Balones talla 4", "quantity": 20, "assigned_to_team": "Alevín A", "status": "ok"},
-        {"item": "Petos (rojo/azul)", "quantity": 30, "assigned_to_team": "Infantil B", "status": "ok"},
-        {"item": "Botiquín reglamentario", "quantity": 1, "assigned_to_team": "Cadete A", "status": "ok"},
-        {"item": "Conos entrenamiento", "quantity": 40, "assigned_to_team": "Juvenil A", "status": "ok"},
+    kit_catalog = [
+        ("camiseta", "Camiseta entrenamiento", 85),
+        ("equipacion_blanca", "Equipacion blanca", 72),
+        ("equipacion_azul", "Equipacion azul", 68),
+        ("calcetines_blancos", "Calcetines blancos", 120),
+        ("calcetines_azules", "Calcetines azules", 95),
+        ("pantalon_largo", "Pantalon largo", 55),
+        ("pantalon_corto", "Pantalon corto", 80),
+        ("sudadera", "Sudadera", 45),
+        ("abrigo", "Abrigo", 18),
+        ("mochila", "Mochila", 60),
+        ("chubasquero", "Chubasquero", 22),
     ]
+    items = [
+        {"item": "Balones talla 4", "quantity": 20, "assigned_to_team": "Alevín A", "status": "ok", "category": "material", "sku": "", "size": ""},
+        {"item": "Conos entrenamiento", "quantity": 40, "assigned_to_team": "Juvenil A", "status": "ok", "category": "material", "sku": "", "size": ""},
+        {"item": "Botiquín reglamentario", "quantity": 1, "assigned_to_team": "Cadete A", "status": "ok", "category": "material", "sku": "", "size": ""},
+    ]
+    for sku, label, qty in kit_catalog:
+        items.append({
+            "item": label,
+            "quantity": qty,
+            "assigned_to_team": "",
+            "status": "ok",
+            "category": "ropa",
+            "sku": sku,
+            "size": "",
+        })
     for i in items:
-        i["id"] = str(uuid.uuid4()); i["created_at"] = now_iso(); i["confirmations"] = []; i["assigned_to_user_id"] = ""
+        i["id"] = str(uuid.uuid4())
+        i["created_at"] = now_iso()
+        i["confirmations"] = []
+        i["assigned_to_user_id"] = ""
+        i["stock_priority"] = stock_priority(i["quantity"])
     await db.inventory.insert_many(items)
+
+
+async def ensure_ropa_inventory_skus():
+    """Asegura filas de inventario de ropa alineadas al catálogo del pack."""
+    kit_catalog = [
+        ("camiseta", "Camiseta entrenamiento"),
+        ("equipacion_blanca", "Equipacion blanca"),
+        ("equipacion_azul", "Equipacion azul"),
+        ("calcetines_blancos", "Calcetines blancos"),
+        ("calcetines_azules", "Calcetines azules"),
+        ("pantalon_largo", "Pantalon largo"),
+        ("pantalon_corto", "Pantalon corto"),
+        ("sudadera", "Sudadera"),
+        ("abrigo", "Abrigo"),
+        ("mochila", "Mochila"),
+        ("chubasquero", "Chubasquero"),
+    ]
+    for sku, label in kit_catalog:
+        existing = await db.inventory.find_one({"category": "ropa", "sku": sku}, {"_id": 0})
+        if existing:
+            continue
+        qty = 75
+        await db.inventory.insert_one({
+            "id": str(uuid.uuid4()),
+            "item": label,
+            "quantity": qty,
+            "assigned_to_team": "",
+            "assigned_to_user_id": "",
+            "status": "ok",
+            "category": "ropa",
+            "sku": sku,
+            "size": "",
+            "confirmations": [],
+            "created_at": now_iso(),
+            "stock_priority": stock_priority(qty),
+        })
 
 
 async def backfill_player_entities():
@@ -1982,6 +2434,7 @@ async def _startup():
         ("seed_admin", seed_admin()),
         ("seed_demo_players", seed_demo_players()),
         ("seed_demo_inventory", seed_demo_inventory()),
+        ("ensure_ropa_inventory_skus", ensure_ropa_inventory_skus()),
     ]:
         try:
             await coro
