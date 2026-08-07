@@ -9,17 +9,12 @@ import uuid
 from datetime import datetime, timezone, timedelta, date
 from typing import List, Optional, Literal
 
-import pandas as pd
 import requests  # used only by RFFM scraping (kept local to this module)
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, UploadFile, File, Form, Query, Header
 from fastapi.responses import StreamingResponse, Response as FastAPIResponse
 from starlette.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import cm
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+# pandas/reportlab se importan lazy en export Excel/PDF para cold start más rápido
 
 # Shared infrastructure lives in deps.py (imported by the feature routers too)
 from deps import (
@@ -862,6 +857,7 @@ def parse_entity(val) -> str:
 
 
 def parse_date_val(val) -> Optional[str]:
+    import pandas as pd
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return None
     if isinstance(val, (datetime, pd.Timestamp)):
@@ -890,6 +886,7 @@ def map_columns(columns) -> dict:
 
 @api_router.post("/players/import/preview")
 async def import_preview(file: UploadFile = File(...), user=Depends(require_roles("admin"))):
+    import pandas as pd
     content = await file.read()
     name = (file.filename or "").lower()
     try:
@@ -981,6 +978,7 @@ async def import_commit(batch_id: str, user=Depends(require_roles("admin"))):
 @api_router.get("/players/export.xlsx")
 async def export_players(category: Optional[str] = None, team: Optional[str] = None,
                           user=Depends(require_roles("admin", "coordinator"))):
+    import pandas as pd
     query = {}
     if category: query["category"] = category
     if team: query["team"] = team
@@ -1002,6 +1000,12 @@ async def export_players(category: Optional[str] = None, team: Optional[str] = N
 # ------------------ PDF Monthly report ------------------
 @api_router.get("/reports/monthly.pdf")
 async def monthly_report(user=Depends(require_roles("admin", "coordinator"))):
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
     players = await db.players.find({}, {"_id": 0}).to_list(5000)
     morosos = [p for p in players if not p.get("payment_status")]
     today = date.today()
