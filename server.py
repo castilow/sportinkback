@@ -22,7 +22,7 @@ from deps import (
     now_iso, rate_limit_ip,
     init_storage, put_object, get_object,
     set_auth_cookies, clear_auth_cookies, sign_in_with_supabase, sign_out_supabase,
-    change_own_password,
+    change_own_password, invalidate_user_cache,
     get_current_user, require_roles, require_club_context,
     resolve_app_user_from_token,
     ensure_supabase_staff_user, delete_supabase_auth_user,
@@ -506,6 +506,7 @@ async def login(data: LoginIn, request: Request, response: Response):
 async def logout(request: Request, response: Response):
     token = request.cookies.get("access_token")
     if token:
+        invalidate_user_cache(token)
         sign_out_supabase(token)
     clear_auth_cookies(response)
     return {"ok": True}

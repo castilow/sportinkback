@@ -315,12 +315,77 @@ def _extract_access_token(request: Optional[Request] = None, authorization: Opti
 
 
 def get_supabase_user(access_token: str) -> dict:
-    resp = _supabase_public_request("GET", "/auth/v1/user", bearer=access_token)
+    resp = _supabase_public_request("GET", "/auth/v1/user", bearer=access_token, timeout=12)
     if resp.status_code == 401:
         raise HTTPException(status_code=401, detail="Token inválido")
     if resp.status_code >= 300:
         raise HTTPException(status_code=401, detail=_supabase_error_message(resp))
     return resp.json()
+
+
+# Caché de usuario: evita llamar a Supabase Auth (~7–12s) en cada request protegido.
+_USER_CACHE: dict[str, tuple[float, dict]] = {}
+_USER_CACHE_TTL_S = float(os.environ.get("AUTH_USER_CACHE_TTL", "180"))
+_USER_CACHE_MAX = 500
+
+
+def _token_cache_key(access_token: str) -> str:
+    import hashlib
+    return hashlib.sha256(access_token.encode("utf-8")).hexdigest()
+
+
+def _user_cache_get(access_token: str) -> Optional[dict]:
+    key = _token_cache_key(access_token)
+    hit = _USER_CACHE.get(key)
+    if not hit:
+        return None
+    expires_at, user = hit
+    if time.monotonic() > expires_at:
+        _USER_CACHE.pop(key, None)
+        return None
+    return dict(user)
+
+
+def _user_cache_set(access_token: str, user: dict) -> None:
+    if len(_USER_CACHE) >= _USER_CACHE_MAX:
+        for k in list(_USER_CACHE.keys())[: _USER_CACHE_MAX // 2]:
+            _USER_CACHE.pop(k, None)
+    _USER_CACHE[_token_cache_key(access_token)] = (
+        time.monotonic() + _USER_CACHE_TTL_S,
+        dict(user),
+    )
+
+
+def invalidate_user_cache(access_token: Optional[str] = None) -> None:
+    if access_token:
+        _USER_CACHE.pop(_token_cache_key(access_token), None)
+    else:
+        _USER_CACHE.clear()
+
+
+def _try_local_jwt_auth_user(access_token: str) -> Optional[dict]:
+    """Valida el JWT en local si hay SUPABASE_JWT_SECRET (ms vs segundos)."""
+    secret = (os.environ.get("SUPABASE_JWT_SECRET") or "").strip()
+    if not secret:
+        return None
+    try:
+        import jwt as pyjwt
+        claims = pyjwt.decode(
+            access_token,
+            secret,
+            algorithms=["HS256"],
+            audience="authenticated",
+            options={"require": ["exp", "sub"]},
+        )
+        return {
+            "id": claims.get("sub"),
+            "email": claims.get("email") or (claims.get("user_metadata") or {}).get("email"),
+            "email_confirmed_at": claims.get("email_confirmed_at") or claims.get("confirmed_at") or "local",
+            "user_metadata": claims.get("user_metadata") or {},
+            "app_metadata": claims.get("app_metadata") or {},
+        }
+    except Exception:
+        return None
 
 
 def _auth_email_verified(auth_user: dict) -> bool:
@@ -379,7 +444,15 @@ async def resolve_app_user_from_token(access_token: str) -> dict:
     IMPORTANTE: no se confía en user_metadata.role del cliente.
     El rol solo sale de profiles / app_documents.users provisionados por el servidor.
     """
-    auth_user = get_supabase_user(access_token)
+    cached = _user_cache_get(access_token)
+    if cached is not None:
+        return cached
+
+    # JWT local (ms) si hay SUPABASE_JWT_SECRET; si no, GET remoto (~7–12s) en thread
+    auth_user = _try_local_jwt_auth_user(access_token)
+    if auth_user is None:
+        auth_user = await asyncio.to_thread(get_supabase_user, access_token)
+
     auth_user_id = auth_user.get("id")
     email = (auth_user.get("email") or "").lower()
     email_verified = _auth_email_verified(auth_user)
@@ -397,9 +470,8 @@ async def resolve_app_user_from_token(access_token: str) -> dict:
                 user["auth_user_id"] = auth_user_id
 
     if not user:
-        # Alta pública pendiente de onboarding: identidad mínima sin privilegios
         meta = auth_user.get("user_metadata") or {}
-        return {
+        pending = {
             "id": auth_user_id,
             "auth_user_id": auth_user_id,
             "email": email,
@@ -411,6 +483,8 @@ async def resolve_app_user_from_token(access_token: str) -> dict:
             "onboarding_completed": False,
             "created_at": now_iso(),
         }
+        _user_cache_set(access_token, pending)
+        return pending
 
     user.pop("password_hash", None)
     user["auth_user_id"] = auth_user_id or user.get("auth_user_id")
@@ -418,7 +492,6 @@ async def resolve_app_user_from_token(access_token: str) -> dict:
     user.setdefault("club_id", None)
     user.setdefault("assigned_teams", user.get("assigned_teams") or [])
 
-    # Staff legacy (app_documents) sin club: asignar el club por defecto
     if not user.get("club_id") and user.get("role") in ("admin", "coordinator", "coach", "office", "physio"):
         default_club = await _fetch_default_club_id()
         if default_club:
@@ -426,6 +499,7 @@ async def resolve_app_user_from_token(access_token: str) -> dict:
             user["onboarding_completed"] = True
 
     user.setdefault("onboarding_completed", bool(user.get("club_id")))
+    _user_cache_set(access_token, user)
     return user
 
 
@@ -608,6 +682,7 @@ __all__ = [
     "sign_up_with_supabase",
     "sign_out_supabase",
     "change_own_password",
+    "invalidate_user_cache",
     "resend_supabase_signup",
     "supabase_rpc",
     "get_current_user",
