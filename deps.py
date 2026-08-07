@@ -242,6 +242,24 @@ def sign_up_with_supabase(email: str, password: str, *, name: str = "") -> dict:
     return resp.json()
 
 
+def change_own_password(access_token: str, new_password: str) -> None:
+    """Cambia la contraseña del usuario autenticado (Ajustes de cuenta).
+
+    Usa el propio access_token del usuario contra /auth/v1/user de Supabase,
+    que permite a cualquier usuario autenticado actualizar SU PROPIA cuenta.
+    No requiere la service role key: no puede tocar otras cuentas.
+    """
+    resp = _supabase_public_request(
+        "PUT",
+        "/auth/v1/user",
+        bearer=access_token,
+        json={"password": new_password},
+        headers={"Content-Type": "application/json"},
+    )
+    if resp.status_code >= 300:
+        raise HTTPException(status_code=400, detail=_supabase_error_message(resp))
+
+
 def resend_supabase_signup(email: str) -> None:
     resp = _supabase_public_request(
         "POST",
@@ -589,6 +607,7 @@ __all__ = [
     "sign_in_with_supabase",
     "sign_up_with_supabase",
     "sign_out_supabase",
+    "change_own_password",
     "resend_supabase_signup",
     "supabase_rpc",
     "get_current_user",
