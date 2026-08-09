@@ -2463,13 +2463,15 @@ app.include_router(api_router, prefix="/api")
 # CORS: explicit origins required when allow_credentials=True.
 # Browsers drop credentials if allow_origins contains "*".
 _cors_raw = os.environ.get('CORS_ORIGINS', '').strip()
+_cors_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
 if _cors_raw and _cors_raw != '*':
-    _cors_origins = [o.strip() for o in _cors_raw.split(',') if o.strip()]
-    _allow_origin_regex = None
-else:
-    # Dev/preview fallback: allow localhost + *.preview.emergentagent.com via regex.
-    _cors_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
-    _allow_origin_regex = r"^https?://([a-z0-9-]+\.)*(preview\.emergentagent\.com|emergentagent\.com)$"
+    _cors_origins = list(dict.fromkeys(
+        _cors_origins + [o.strip().rstrip('/') for o in _cors_raw.split(',') if o.strip()]
+    ))
+# Vercel (prod + previews) y Emergent: el login con cookies necesita el Origin exacto.
+_allow_origin_regex = (
+    r"^https://([a-z0-9-]+\.)*(vercel\.app|preview\.emergentagent\.com|emergentagent\.com)$"
+)
 
 app.add_middleware(
     CORSMiddleware,
