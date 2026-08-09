@@ -10,6 +10,8 @@ services:
         value: 3.12.7
       - key: COOKIE_SECURE
         value: "True"
+      - key: COOKIE_SAMESITE
+        value: "none"
       # Define estos en el panel de Render (Environment), NO los subas al repo:
       - key: DATABASE_URL
         sync: false

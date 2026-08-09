@@ -201,15 +201,43 @@ def _cookie_secure() -> bool:
     return os.environ.get("ENV", os.environ.get("ENVIRONMENT", "")).lower() in ("production", "prod")
 
 
+def _cookie_samesite() -> str:
+    """Cross-site (Vercel → Render) exige SameSite=None + Secure.
+
+    Con SameSite=Lax el navegador no guarda/envía la cookie en fetch
+    cross-origin, y el panel falla con «No autenticado» tras el login.
+    """
+    override = (os.environ.get("COOKIE_SAMESITE") or "").strip().lower()
+    if override in ("none", "lax", "strict"):
+        return override
+    return "none" if _cookie_secure() else "lax"
+
+
 def set_auth_cookies(response: Response, access: str, refresh: str):
     secure = _cookie_secure()
-    response.set_cookie("access_token", access, httponly=True, secure=secure, samesite="lax", max_age=43200, path="/")
-    response.set_cookie("refresh_token", refresh, httponly=True, secure=secure, samesite="lax", max_age=604800, path="/")
+    samesite = _cookie_samesite()
+    # SameSite=None requiere Secure; forzar secure si pedimos none.
+    if samesite == "none":
+        secure = True
+    response.set_cookie(
+        "access_token", access,
+        httponly=True, secure=secure, samesite=samesite,
+        max_age=43200, path="/",
+    )
+    response.set_cookie(
+        "refresh_token", refresh,
+        httponly=True, secure=secure, samesite=samesite,
+        max_age=604800, path="/",
+    )
 
 
 def clear_auth_cookies(response: Response):
-    response.delete_cookie("access_token", path="/")
-    response.delete_cookie("refresh_token", path="/")
+    secure = _cookie_secure()
+    samesite = _cookie_samesite()
+    if samesite == "none":
+        secure = True
+    response.delete_cookie("access_token", path="/", secure=secure, samesite=samesite)
+    response.delete_cookie("refresh_token", path="/", secure=secure, samesite=samesite)
 
 
 def sign_in_with_supabase(email: str, password: str) -> dict:
