@@ -3,6 +3,7 @@ from pathlib import Path as _Path
 ROOT_DIR = _Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
+import asyncio
 import io
 import os
 import uuid
@@ -396,11 +397,12 @@ async def deduct_inventory_for_kit_delivery(previous_items: List[dict], next_ite
 # ------------------ Auth endpoints ------------------
 LOGIN_MAX_ATTEMPTS = 5
 LOGIN_LOCKOUT_MINUTES = 15
+# Lockout en memoria: evita 4–6 round-trips a BD en cada login (antes por JSONB).
+_LOGIN_ATTEMPTS: dict[str, dict] = {}
 
 
 async def _get_login_attempts(identifier: str) -> dict:
-    record = await db.login_attempts.find_one({"identifier": identifier}, {"_id": 0})
-    return record or {"identifier": identifier, "count": 0, "locked_until": None}
+    return _LOGIN_ATTEMPTS.get(identifier) or {"identifier": identifier, "count": 0, "locked_until": None}
 
 
 async def _register_failed_login(identifier: str):
@@ -409,15 +411,15 @@ async def _register_failed_login(identifier: str):
     update = {"identifier": identifier, "count": count, "last_attempt": now_iso()}
     if count >= LOGIN_MAX_ATTEMPTS:
         update["locked_until"] = (datetime.now(timezone.utc) + timedelta(minutes=LOGIN_LOCKOUT_MINUTES)).isoformat()
-    await db.login_attempts.update_one({"identifier": identifier}, {"$set": update}, upsert=True)
+    _LOGIN_ATTEMPTS[identifier] = update
 
 
 async def _clear_login_attempts(identifier: str):
-    await db.login_attempts.delete_one({"identifier": identifier})
+    _LOGIN_ATTEMPTS.pop(identifier, None)
 
 
 async def _check_login_lockout(identifier: str):
-    record = await db.login_attempts.find_one({"identifier": identifier}, {"_id": 0})
+    record = _LOGIN_ATTEMPTS.get(identifier)
     if not record:
         return
     locked_until = record.get("locked_until")
@@ -2048,7 +2050,16 @@ async def dashboard_stats(user=Depends(get_current_user)):
     query = {}
     if user.get("club_id"):
         query["club_id"] = user["club_id"]
-    players = await db.players.find(query, {"_id": 0}).to_list(5000)
+
+    # Consultas en paralelo (antes secuenciales → suma de latencias BD).
+    players, incidents_open, tickets_pending, injury_cases, matches = await asyncio.gather(
+        db.players.find(query, {"_id": 0}).to_list(5000),
+        db.incidents.count_documents({"status": "abierta"}),
+        db.tickets.count_documents({"status": "pendiente"}),
+        db.injuries.find({}, {"_id": 0, "status": 1, "closed_at": 1}).to_list(5000),
+        db.rffm_matches.find({}, {"_id": 0}).to_list(2000),
+    )
+
     if user.get("club_id"):
         players = [p for p in players if not p.get("club_id") or p.get("club_id") == user["club_id"]]
     total = len(players)
@@ -2056,47 +2067,43 @@ async def dashboard_stats(user=Depends(get_current_user)):
     attention_count = sum(1 for p in players if player_has_attention(p))
     today = date.today()
     ins_expired = ins_soon = ins_ok = 0
-    for p in players:
-        exp = p.get("insurance_expiry")
-        if not exp:
-            ins_expired += 1; continue
-        try:
-            d = date.fromisoformat(exp)
-            delta = (d - today).days
-            if delta < 0: ins_expired += 1
-            elif delta < 30: ins_soon += 1
-            else: ins_ok += 1
-        except Exception:
-            ins_expired += 1
     by_category = {}
     by_entity = {"club": 0, "fundacion": 0}
     for p in players:
-        by_category[p.get("category", "Sin categoría")] = by_category.get(p.get("category", "Sin categoría"), 0) + 1
+        exp = p.get("insurance_expiry")
+        if not exp:
+            ins_expired += 1
+        else:
+            try:
+                d = date.fromisoformat(exp)
+                delta = (d - today).days
+                if delta < 0:
+                    ins_expired += 1
+                elif delta < 30:
+                    ins_soon += 1
+                else:
+                    ins_ok += 1
+            except Exception:
+                ins_expired += 1
+        cat = p.get("category", "Sin categoría")
+        by_category[cat] = by_category.get(cat, 0) + 1
         by_entity[p.get("entity", "club")] = by_entity.get(p.get("entity", "club"), 0) + 1
 
-    incidents_open = await db.incidents.count_documents({"status": "abierta"})
-    tickets_pending = await db.tickets.count_documents({"status": "pendiente"})
-
-    injury_cases = await db.injuries.find({}, {"_id": 0, "status": 1, "closed_at": 1}).to_list(5000)
     injuries_baja = sum(1 for c in injury_cases if c.get("status") == "Baja" and not c.get("closed_at"))
     injuries_duda = sum(1 for c in injury_cases if c.get("status") == "Duda" and not c.get("closed_at"))
     injuries_open = injuries_baja + injuries_duda
 
-    # Estimación de horas administrativas ahorradas (no es una medición real,
-    # es una regla de negocio orientativa: ~0.12h/jugador/semana). Se marca
-    # como "estimated" para que el frontend lo muestre como estimación.
+    # Estimación de horas administrativas (~0.12h/jugador/semana).
     hours_saved = round(total * 0.12 * 4, 1)
 
-    # Próximo partido: el primero sin jugar de los calendarios RFFM ya
-    # sincronizados (rffm_matches), no un dato inventado. Si el club todavía
-    # no sincronizó ningún calendario, devolvemos null en vez de un rival falso.
     next_match = None
     _best_date = None
-    for m in await db.rffm_matches.find({}, {"_id": 0}).to_list(2000):
+    today_iso = today.isoformat()
+    for m in matches:
         if m.get("played"):
             continue
         iso = parse_date_val(m.get("match_date"))
-        if not iso or iso < today.isoformat():
+        if not iso or iso < today_iso:
             continue
         if _best_date is None or iso < _best_date:
             _best_date = iso
@@ -2127,6 +2134,12 @@ async def dashboard_stats(user=Depends(get_current_user)):
         "hours_saved_estimated": True,
         "next_match": next_match,
     }
+
+
+@api_router.get("/health")
+async def health():
+    """Ping ligero (sin BD) para keep-alive y monitores."""
+    return {"ok": True, "ts": now_iso()}
 
 
 @api_router.get("/")
@@ -2435,12 +2448,22 @@ async def _startup():
             logger.info("Datos de jugadores: tabla SQL public.players (temporada 25-26)")
     except Exception as exc:
         logger.warning("No se pudo comprobar jugadores SQL: %s", exc)
-    for label, coro in [
+
+    # En producción omitir seeds demo (ralentizan el cold start).
+    skip_demo = (os.environ.get("SKIP_SEED") or "").strip().lower() in ("1", "true", "yes", "on")
+    seed_jobs = [
         ("seed_admin", seed_admin()),
-        ("seed_demo_players", seed_demo_players()),
-        ("seed_demo_inventory", seed_demo_inventory()),
         ("ensure_ropa_inventory_skus", ensure_ropa_inventory_skus()),
-    ]:
+    ]
+    if not skip_demo:
+        seed_jobs[1:1] = [
+            ("seed_demo_players", seed_demo_players()),
+            ("seed_demo_inventory", seed_demo_inventory()),
+        ]
+    else:
+        logger.info("SKIP_SEED activo: se omiten datos demo en el arranque")
+
+    for label, coro in seed_jobs:
         try:
             await coro
         except Exception as exc:

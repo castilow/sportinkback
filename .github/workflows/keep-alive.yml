@@ -1,0 +1,27 @@
+# Mantiene despierto el servicio Render (evita cold start de varios minutos).
+name: Keep Render awake
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /api/health
+        run: |
+          set -e
+          URL="${RENDER_HEALTH_URL:-https://sportinkback.onrender.com/api/health}"
+          for i in 1 2 3; do
+            if curl -fsS --max-time 45 "$URL"; then
+              echo
+              echo "OK intento $i"
+              exit 0
+            fi
+            echo "Fallo intento $i, reintento…"
+            sleep 5
+          done
+          echo "Keep-alive falló (el deploy puede estar caído); no bloquea el repo."
+          exit 0

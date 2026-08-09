@@ -2,9 +2,11 @@ services:
   - type: web
     name: sportinkback
     runtime: python
-    plan: free
+    # Starter (~7€): sin sleep automático. El keep-alive de GitHub sigue ayudando.
+    plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /api/health
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.7
@@ -12,12 +14,20 @@ services:
         value: "True"
       - key: COOKIE_SAMESITE
         value: "none"
+      # Crítico: NO uses Management API en runtime (es lento). Déjalo en false.
+      - key: USE_SUPABASE_MGMT
+        value: "false"
+      - key: SKIP_SEED
+        value: "true"
       # Define estos en el panel de Render (Environment), NO los subas al repo:
       - key: DATABASE_URL
         sync: false
       - key: DIRECT_URL
         sync: false
       - key: JWT_SECRET
+        sync: false
+      # JWT secret del proyecto Supabase (Settings → API). Acelera /auth/me de ~10s a ms.
+      - key: SUPABASE_JWT_SECRET
         sync: false
       - key: SUPABASE_URL
         sync: false
@@ -27,6 +37,7 @@ services:
         sync: false
       - key: SUPABASE_DB_PASSWORD
         sync: false
+      # Solo para migraciones/CLI local. NO hace falta en el web service.
       - key: SUPABASE_ACCESS_TOKEN
         sync: false
       - key: MONGO_URL

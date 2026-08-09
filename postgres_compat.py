@@ -12,13 +12,26 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 
 import requests
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+try:
+    import psycopg
+except ImportError:  # pragma: no cover
+    psycopg = None  # type: ignore
+
 _logger = logging.getLogger("rayo.postgres_compat")
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
 
 
 def _project_ref_from_env() -> str:
@@ -319,6 +332,19 @@ class PostgresCompatDB:
         self._collections: dict[str, PostgresCollection] = {}
         self._psql_bin = os.environ.get("PSQL_BIN") or shutil.which("psql") or "/opt/homebrew/opt/libpq/bin/psql"
         self._sanitized_url, self._password = self._split_password(database_url)
+        self._lock = threading.Lock()
+        self._conn = None
+        # Por defecto: Postgres directo (psycopg/psql). Management API solo si se fuerza.
+        self._prefer_mgmt = _env_flag("USE_SUPABASE_MGMT", default=False)
+        if self._prefer_mgmt and self._management_token():
+            _logger.warning(
+                "USE_SUPABASE_MGMT=1: consultas por Management API (lento). "
+                "En Render desactívalo y usa DATABASE_URL del pooler."
+            )
+        elif psycopg is not None:
+            _logger.info("Postgres: conexión directa con psycopg (DATABASE_URL)")
+        else:
+            _logger.info("Postgres: psql subprocess (psycopg no instalado)")
         self._ensure_schema()
 
     def __getattr__(self, item: str) -> PostgresCollection:
@@ -329,7 +355,13 @@ class PostgresCompatDB:
         return self._collections[item]
 
     def close(self):
-        return None
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
 
     def _split_password(self, database_url: str) -> tuple[str, Optional[str]]:
         parsed = urlsplit(database_url)
@@ -346,6 +378,10 @@ class PostgresCompatDB:
 
     def _management_token(self) -> str:
         return os.environ.get("SUPABASE_ACCESS_TOKEN", "").strip()
+
+    def _use_management_api(self) -> bool:
+        """Management API solo bajo petición explícita (muy lenta en runtime)."""
+        return self._prefer_mgmt and bool(self._management_token())
 
     def _management_query(self, sql: str):
         token = self._management_token()
@@ -377,10 +413,62 @@ class PostgresCompatDB:
                     time.sleep(2 * (attempt + 1))
         raise last_err  # type: ignore[misc]
 
-    def _run_psql(self, sql: str) -> str:
-        mgmt = self._management_query(sql)
-        if mgmt is not None:
-            return self._format_management_output(mgmt)
+    def _ensure_conn(self):
+        if psycopg is None:
+            return None
+        if self._conn is not None and not self._conn.closed:
+            return self._conn
+        self._conn = psycopg.connect(self.database_url, connect_timeout=15)
+        return self._conn
+
+    def _format_psycopg_result(self, cur) -> str:
+        if cur.description is None:
+            return ""
+        rows = cur.fetchall()
+        if not rows:
+            return ""
+        lines: list[str] = []
+        for row in rows:
+            if len(row) == 1:
+                val = row[0]
+                if val is None:
+                    continue
+                if isinstance(val, (dict, list)):
+                    lines.append(json.dumps(val, ensure_ascii=False))
+                else:
+                    lines.append(str(val))
+            else:
+                # Fila multi-columna → JSON estable para parseo opcional
+                payload = {}
+                for i, col in enumerate(cur.description):
+                    payload[col.name] = row[i]
+                lines.append(json.dumps(payload, ensure_ascii=False, default=str))
+        return "\n".join(lines)
+
+    def _run_psycopg(self, sql: str) -> str:
+        with self._lock:
+            conn = self._ensure_conn()
+            if conn is None:
+                raise RuntimeError("psycopg no disponible")
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(sql)
+                    out = self._format_psycopg_result(cur)
+                conn.commit()
+                return out
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+                raise
+
+    def _run_psql_subprocess(self, sql: str) -> str:
         env = os.environ.copy()
         if self._password:
             env["PGPASSWORD"] = self._password
@@ -392,6 +480,14 @@ class PostgresCompatDB:
             env=env,
         )
         return proc.stdout.strip()
+
+    def _run_psql(self, sql: str) -> str:
+        if self._use_management_api():
+            mgmt = self._management_query(sql)
+            return self._format_management_output(mgmt)
+        if psycopg is not None:
+            return self._run_psycopg(sql)
+        return self._run_psql_subprocess(sql)
 
     @staticmethod
     def _format_management_output(data) -> str:
@@ -433,35 +529,38 @@ class PostgresCompatDB:
     async def execute_scalar(self, sql: str) -> str:
         return await self.execute(sql)
 
+    def _parse_mgmt_json_rows(self, data) -> list[dict]:
+        rows: list[dict] = []
+        if not isinstance(data, list):
+            return rows
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            # Algunas consultas envuelven el resultado en una sola columna JSON.
+            if len(row) == 1:
+                val = next(iter(row.values()))
+                if isinstance(val, dict):
+                    rows.append(val)
+                    continue
+                if isinstance(val, str):
+                    try:
+                        parsed = json.loads(val)
+                        if isinstance(parsed, dict):
+                            rows.append(parsed)
+                            continue
+                        if isinstance(parsed, list):
+                            rows.extend([r for r in parsed if isinstance(r, dict)])
+                            continue
+                    except Exception:
+                        pass
+            rows.append(row)
+        return rows
+
     async def fetch_json_rows(self, sql: str) -> list[dict]:
-        if self._management_token():
+        if self._use_management_api():
             data = await asyncio.to_thread(self._management_query, sql)
             if data is not None:
-                rows: list[dict] = []
-                for row in data:
-                    if not isinstance(row, dict):
-                        continue
-                    # Algunas consultas envuelven el resultado en una sola columna JSON.
-                    # Si solo hay una columna string, intentar parsearla; si no es JSON,
-                    # conservar la fila tal cual (p. ej. select id::text).
-                    if len(row) == 1:
-                        val = next(iter(row.values()))
-                        if isinstance(val, dict):
-                            rows.append(val)
-                            continue
-                        if isinstance(val, str):
-                            try:
-                                parsed = json.loads(val)
-                                if isinstance(parsed, dict):
-                                    rows.append(parsed)
-                                    continue
-                                if isinstance(parsed, list):
-                                    rows.extend([r for r in parsed if isinstance(r, dict)])
-                                    continue
-                            except Exception:
-                                pass
-                    rows.append(row)
-                return rows
+                return self._parse_mgmt_json_rows(data)
         output = await self.execute(sql)
         if not output:
             return []
