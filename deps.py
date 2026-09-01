@@ -535,16 +535,26 @@ async def _fetch_default_club_id() -> Optional[str]:
     if not hasattr(db, "fetch_json_rows"):
         return None
     try:
+        # OJO: fetch_json_rows hace json.loads() de cada línea de la salida.
+        # Una consulta de UNA sola columna devuelve el valor en crudo (un UUID
+        # pelado), que no es JSON válido, y reventaba con JSONDecodeError.
+        # El except de abajo se lo tragaba y el usuario se quedaba sin club:
+        # /teams y /clubs/me respondían "Tu cuenta no tiene club asignado"
+        # aunque el club existiera. Hay que envolverlo en json_build_object.
         rows = await db.fetch_json_rows(
             """
-            select id::text as id from public.clubs
+            select json_build_object('id', id::text)::text
+            from public.clubs
             where is_default = true or slug = 'rayo-majadahonda'
             order by is_default desc
             limit 1;
             """
         )
         return rows[0]["id"] if rows else None
-    except Exception:
+    except Exception as exc:
+        # Antes esto era un `return None` mudo. Un fallo aquí deja a TODO el
+        # staff sin club, así que como mínimo tiene que verse en el log.
+        logger.warning("No se pudo resolver el club por defecto: %s", exc)
         return None
 
 
@@ -596,7 +606,7 @@ def supabase_admin_find_user_by_email(email: str) -> Optional[dict]:
     return None
 
 
-def ensure_supabase_staff_user(email: str, password: str, *, name: str, role: str, assigned_teams: Optional[list] = None, app_user_id: Optional[str] = None) -> dict:
+def ensure_supabase_staff_user(email: str, password: str, *, name: str, role: str, assigned_teams: Optional[list] = None, app_user_id: Optional[str] = None, reset_password: bool = False) -> dict:
     email = email.lower()
     payload = {
         "email": email,
@@ -612,10 +622,16 @@ def ensure_supabase_staff_user(email: str, password: str, *, name: str, role: st
     }
     existing = supabase_admin_find_user_by_email(email)
     if existing:
+        # No se reenvía la contraseña salvo petición explícita: hacerlo en cada
+        # arranque revertía en silencio cualquier cambio hecho por el usuario
+        # desde Ajustes de cuenta.
+        update_payload = dict(payload)
+        if not reset_password:
+            update_payload.pop("password", None)
         resp = _supabase_admin_request(
             "PUT",
             f"/auth/v1/admin/users/{existing['id']}",
-            json=payload,
+            json=update_payload,
             headers={"Content-Type": "application/json"},
         )
         if resp.status_code >= 300:

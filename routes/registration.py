@@ -33,6 +33,26 @@ from deps import (
 
 router = APIRouter()
 
+
+def _public_registration_enabled() -> bool:
+    """El alta pública crea un CLUB nuevo, no un usuario del club actual.
+
+    Mientras la app sea monocliente (solo Rayo Majadahonda), debe estar
+    cerrada: hay endpoints que todavía no filtran por club, así que un club
+    recién creado vería datos del club por defecto. Se abre con
+    PUBLIC_REGISTRATION=1 cuando el aislamiento esté terminado.
+    """
+    import os
+
+    return (os.environ.get("PUBLIC_REGISTRATION") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+async def require_public_registration():
+    if not _public_registration_enabled():
+        # 404 y no 403: no revelamos que el endpoint existe.
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
 MAX_TEAMS = 40
 MAX_PLAYERS = 500
 SPORT_PRESETS = {
@@ -234,7 +254,7 @@ async def _find_registration_by_auth(auth_user_id: str) -> Optional[dict]:
     return await db.public_registrations.find_one({"auth_user_id": auth_user_id}, {"_id": 0})
 
 
-@router.post("/auth/register", status_code=202)
+@router.post("/auth/register", status_code=202, dependencies=[Depends(require_public_registration)])
 async def register_public(data: PublicRegistrationIn, request: Request):
     await rate_limit_ip(request, "public_register", max_hits=5, window_s=3600)
     email = data.admin.email.lower()
@@ -310,7 +330,7 @@ class ResendVerificationIn(BaseModel):
     email: EmailStr
 
 
-@router.post("/auth/resend-verification")
+@router.post("/auth/resend-verification", dependencies=[Depends(require_public_registration)])
 async def resend_verification(data: ResendVerificationIn, request: Request):
     await rate_limit_ip(request, "resend_verification", max_hits=8, window_s=3600)
     try:

@@ -76,6 +76,12 @@ create unique index if not exists uq_app_documents_login_identifier
 create unique index if not exists uq_app_documents_poll_votes_pair
     on public.app_documents ((doc->>'poll_id'), (doc->>'voter_name'))
     where collection = 'poll_votes' and doc ? 'poll_id' and doc ? 'voter_name';
+
+-- NOTA: la RLS y los REVOKE de esta tabla viven en la migración
+-- 20260901090000_app_documents_rls.sql, no aquí. _ensure_schema() se ejecuta
+-- en CADA arranque y dentro de __init__, así que si el rol del pooler no es
+-- propietario de la tabla, un ALTER/REVOKE aquí lanza excepción y el backend
+-- no llega ni a levantar.
 """
 
 
