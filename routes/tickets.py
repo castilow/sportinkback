@@ -7,7 +7,8 @@ from pydantic import BaseModel
 
 from deps import (
     db, now_iso, uuid, APP_NAME, MAX_UPLOAD_BYTES,
-    get_current_user, get_user_from_request_values, require_roles, put_object, get_object,
+    get_current_user, get_user_from_request_values, require_roles, require_club_context,
+    put_object, get_object,
 )
 
 router = APIRouter()
@@ -42,6 +43,7 @@ async def upload_ticket(file: UploadFile = File(...), concept: str = Form(""), a
         "uploader_name": user.get("name", ""),
         "status": "pendiente",
         "approval_notes": "",
+        "club_id": require_club_context(user),
         "created_at": now_iso(),
     }
     await db.tickets.insert_one(ticket)
@@ -51,7 +53,7 @@ async def upload_ticket(file: UploadFile = File(...), concept: str = Form(""), a
 
 @router.get("/tickets")
 async def list_tickets(user=Depends(get_current_user)):
-    q = {}
+    q = {"club_id": require_club_context(user)}
     if user["role"] == "coach":
         q["uploaded_by"] = user["id"]
     return await db.tickets.find(q, {"_id": 0}).sort("created_at", -1).to_list(500)
@@ -60,7 +62,8 @@ async def list_tickets(user=Depends(get_current_user)):
 @router.get("/tickets/{ticket_id}/file")
 async def ticket_file(ticket_id: str, auth: Optional[str] = Query(None), authorization: Optional[str] = Header(None), request: Request = None):
     user = await get_user_from_request_values(request=request, authorization=authorization, query_token=auth)
-    ticket = await db.tickets.find_one({"id": ticket_id}, {"_id": 0})
+    ticket = await db.tickets.find_one(
+        {"id": ticket_id, "club_id": require_club_context(user)}, {"_id": 0})
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket no encontrado")
     # Coaches can only access their own tickets. Admins/coordinators can see all.
@@ -73,7 +76,8 @@ async def ticket_file(ticket_id: str, auth: Optional[str] = Query(None), authori
 @router.post("/tickets/{ticket_id}/approve")
 async def approve_ticket(ticket_id: str, data: TicketApproveIn, user=Depends(require_roles("admin"))):
     new_status = "aprobado" if data.approved else "rechazado"
-    result = await db.tickets.update_one({"id": ticket_id}, {"$set": {
+    result = await db.tickets.update_one(
+        {"id": ticket_id, "club_id": require_club_context(user)}, {"$set": {
         "status": new_status, "approval_notes": data.notes,
         "approved_by": user["id"], "approved_at": now_iso(),
     }})

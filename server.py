@@ -26,7 +26,7 @@ from deps import (
     change_own_password, invalidate_user_cache,
     get_current_user, require_roles, require_club_context,
     resolve_app_user_from_token,
-    ensure_supabase_staff_user, delete_supabase_auth_user,
+    ensure_supabase_staff_user, delete_supabase_auth_user, sign_up_with_supabase,
 )
 
 CATEGORIES = ["Prebenjamín", "Benjamín", "Alevín", "Infantil", "Cadete", "Juvenil", "Senior/Filial", "Femenino"]
@@ -60,6 +60,20 @@ class UserCreate(BaseModel):
     email: EmailStr
     password: str
     name: str
+    role: Literal["admin", "coordinator", "coach", "office", "physio"]
+    assigned_teams: List[str] = []
+
+
+class SelfSignupIn(BaseModel):
+    """Alta de una persona del club. No crea clubes: entra en el que ya existe."""
+    name: str = Field(min_length=2, max_length=120)
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+    # 'admin' no se puede pedir: la dirección se asigna a mano.
+    requested_role: Literal["coordinator", "coach", "office", "physio"]
+
+
+class ApproveUserIn(BaseModel):
     role: Literal["admin", "coordinator", "coach", "office", "physio"]
     assigned_teams: List[str] = []
 
@@ -170,12 +184,32 @@ class PlayerBillingIn(BaseModel):
     payments: List[PaymentConceptIn] = Field(default_factory=list)
 
 
+class GuardianIn(BaseModel):
+    """Padre/madre o tutor. orden 1 y 2, como en public.guardians."""
+    orden: Literal[1, 2]
+    nombre: str = ""
+    dni: str = ""
+    telefono: str = ""
+    email: str = ""
+    titular_pago: bool = False
+
+
+class BankAccountIn(BaseModel):
+    entidad: str = ""
+    titular: str = ""
+    iban: str = ""
+    paga_en_tienda: bool = False
+
+
 class OfficePlayerUpdateIn(BaseModel):
     payment_status: Optional[bool] = None
     scholarship: Optional[bool] = None
     scholarship_pct: Optional[float] = None
     scholarship_notes: Optional[str] = None
     billing: Optional[PlayerBillingIn] = None
+    guardians: Optional[List[GuardianIn]] = None
+    bank: Optional[BankAccountIn] = None
+    empadronado: Optional[bool] = None
 
 
 class PlayerRegistrationIn(BaseModel):
@@ -274,6 +308,61 @@ def enrich_player(p: dict) -> dict:
         p["dni_semaforo"] = semaforo_for_expiry(p.get("dni_expiry"))
     p["has_attention"] = player_has_attention(p)
     return p
+
+
+def scoped(user: dict, query: Optional[dict] = None) -> dict:
+    """Añade el club del usuario a una consulta. Sin club, no hay resultados.
+
+    Estas colecciones viven en app_documents y hasta ahora no filtraban por
+    club: con más de un club en la base, cada uno veía el inventario, las
+    incidencias, la asistencia y los tickets de los demás.
+    """
+    q = dict(query or {})
+    q["club_id"] = require_club_context(user)
+    return q
+
+
+def stamped(user: dict, doc: dict) -> dict:
+    """Marca un documento nuevo con el club de quien lo crea."""
+    doc["club_id"] = require_club_context(user)
+    return doc
+
+
+# ------------------ Visibilidad de datos sensibles ------------------
+# El IBAN y el DNI de los tutores son datos personales de familias con
+# menores. Solo dirección y oficina ven el IBAN completo; coordinación lo ve
+# enmascarado; entrenadores y fisio no ven datos bancarios en absoluto.
+IBAN_FULL_ROLES = ("admin", "office")
+BANK_VISIBLE_ROLES = ("admin", "office", "coordinator")
+GUARDIAN_DNI_ROLES = ("admin", "office", "coordinator")
+
+
+def mask_iban(iban: str) -> str:
+    clean = (iban or "").replace(" ", "").strip()
+    if not clean:
+        return ""
+    if len(clean) <= 4:
+        return "••••"
+    return f"•••• {clean[-4:]}"
+
+
+def mask_player_for_role(player: dict, role: Optional[str]) -> dict:
+    """Recorta los campos sensibles según el rol de quien consulta."""
+    out = dict(player)
+    bank = dict(out.get("bank") or {})
+    if role not in BANK_VISIBLE_ROLES:
+        out.pop("bank", None)
+    elif bank:
+        if role not in IBAN_FULL_ROLES:
+            bank["iban"] = mask_iban(bank.get("iban"))
+            bank["iban_masked"] = True
+        out["bank"] = bank
+    if role not in GUARDIAN_DNI_ROLES:
+        out["guardians"] = [
+            {k: v for k, v in g.items() if k != "dni"}
+            for g in (out.get("guardians") or [])
+        ]
+    return out
 
 
 def player_has_attention(p: dict) -> bool:
@@ -504,6 +593,46 @@ async def login(data: LoginIn, request: Request, response: Response):
     return enriched
 
 
+@api_router.post("/auth/signup", status_code=202)
+async def self_signup(data: SelfSignupIn, request: Request):
+    """Alta pública de una persona DEL CLUB.
+
+    Crea la cuenta en Supabase Auth y un usuario con rol "pending": no ve
+    nada hasta que dirección o coordinación lo aprueba desde Usuarios.
+    """
+    await rate_limit_ip(request, "self_signup", max_hits=5, window_s=3600)
+    email = data.email.lower()
+
+    if await db.users.find_one({"email": email}):
+        raise HTTPException(status_code=400, detail="Ya existe una cuenta con ese correo. Inicia sesión.")
+
+    club_id = await _fetch_default_club_id()
+    if not club_id:
+        raise HTTPException(status_code=503, detail="El club no está configurado. Avisa a dirección.")
+
+    signup = await asyncio.to_thread(
+        sign_up_with_supabase, email, data.password, name=data.name.strip()
+    )
+    auth_user = signup.get("user") or {}
+
+    await db.users.insert_one({
+        "id": str(uuid.uuid4()),
+        "auth_user_id": auth_user.get("id"),
+        "email": email,
+        "name": data.name.strip(),
+        "role": "pending",
+        "requested_role": data.requested_role,
+        "assigned_teams": [],
+        "club_id": club_id,
+        "created_at": now_iso(),
+    })
+    return {
+        "status": "pending_approval",
+        "email": email,
+        "message": "Cuenta creada. Verifica tu correo; dirección debe aprobar tu acceso.",
+    }
+
+
 @api_router.post("/auth/logout")
 async def logout(request: Request, response: Response):
     token = request.cookies.get("access_token")
@@ -534,14 +663,37 @@ async def change_password(data: ChangePasswordIn, request: Request, user: dict =
 
 
 # ------------------ User management (admin) ------------------
+# Roles que cada rol puede crear/gestionar. Coordinación no puede crear
+# dirección: si pudiera, cualquier coordinador se autoascendería a admin.
+ASSIGNABLE_ROLES = {
+    "admin": ("admin", "coordinator", "coach", "office", "physio"),
+    "coordinator": ("coordinator", "coach", "office", "physio"),
+}
+
+
 @api_router.get("/users")
-async def list_users(user=Depends(require_roles("admin"))):
-    users = await db.users.find({}, {"_id": 0, "password_hash": 0}).to_list(500)
+async def list_users(user=Depends(require_roles("admin", "coordinator"))):
+    club_id = require_club_context(user)
+    users = await db.users.find({"club_id": club_id}, {"_id": 0, "password_hash": 0}).to_list(500)
+    users = [u for u in users if u.get("club_id") == club_id]
     return users
 
 
+@api_router.get("/users/assignable-roles")
+async def assignable_roles(user=Depends(require_roles("admin", "coordinator"))):
+    """Roles que el usuario autenticado puede asignar al crear una cuenta."""
+    return {"roles": list(ASSIGNABLE_ROLES.get(user.get("role"), ()))}
+
+
 @api_router.post("/users")
-async def create_user(data: UserCreate, user=Depends(require_roles("admin"))):
+async def create_user(data: UserCreate, user=Depends(require_roles("admin", "coordinator"))):
+    club_id = require_club_context(user)
+    allowed_roles = ASSIGNABLE_ROLES.get(user.get("role"), ())
+    if data.role not in allowed_roles:
+        raise HTTPException(
+            status_code=403,
+            detail=f"No puedes crear usuarios con el rol «{data.role}».",
+        )
     email = data.email.lower()
     existing = await db.users.find_one({"email": email})
     if existing:
@@ -562,6 +714,7 @@ async def create_user(data: UserCreate, user=Depends(require_roles("admin"))):
         "name": data.name,
         "role": data.role,
         "assigned_teams": data.assigned_teams,
+        "club_id": club_id,
         "created_at": now_iso(),
     }
     await db.users.insert_one(new_user)
@@ -570,13 +723,49 @@ async def create_user(data: UserCreate, user=Depends(require_roles("admin"))):
     return new_user
 
 
+@api_router.post("/users/{user_id}/approve")
+async def approve_user(user_id: str, data: ApproveUserIn, user=Depends(require_roles("admin", "coordinator"))):
+    """Da el alta a una cuenta pendiente con el rol que decida quien aprueba."""
+    club_id = require_club_context(user)
+    allowed = ASSIGNABLE_ROLES.get(user.get("role"), ())
+    if data.role not in allowed:
+        raise HTTPException(status_code=403, detail=f"No puedes asignar el rol «{data.role}».")
+
+    target = await db.users.find_one({"id": user_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    if target.get("club_id") != club_id:
+        raise HTTPException(status_code=403, detail="Ese usuario es de otro club")
+    if target.get("role") != "pending":
+        raise HTTPException(status_code=400, detail="Esa cuenta ya está aprobada")
+
+    await db.users.update_one({"id": user_id}, {"$set": {
+        "role": data.role,
+        "assigned_teams": data.assigned_teams,
+        "approved_by": user["id"],
+        "approved_at": now_iso(),
+    }})
+    # La sesión del aprobado está cacheada hasta 3 min con rol "pending".
+    invalidate_user_cache()
+    return await db.users.find_one({"id": user_id}, {"_id": 0})
+
+
 @api_router.delete("/users/{user_id}")
-async def delete_user(user_id: str, user=Depends(require_roles("admin"))):
+async def delete_user(user_id: str, user=Depends(require_roles("admin", "coordinator"))):
+    club_id = require_club_context(user)
     if user_id == user["id"]:
         raise HTTPException(status_code=400, detail="No puedes eliminarte a ti mismo")
     target = await db.users.find_one({"id": user_id}, {"_id": 0})
     if not target:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    if target.get("club_id") != club_id:
+        raise HTTPException(status_code=403, detail="Ese usuario es de otro club")
+    # "pending" siempre se puede rechazar: aún no tiene acceso a nada.
+    if target.get("role") not in tuple(ASSIGNABLE_ROLES.get(user.get("role"), ())) + ("pending",):
+        raise HTTPException(
+            status_code=403,
+            detail="No puedes eliminar usuarios con ese rol.",
+        )
     if target.get("auth_user_id"):
         delete_supabase_auth_user(target["auth_user_id"])
     result = await db.users.delete_one({"id": user_id})
@@ -655,13 +844,16 @@ async def list_players(
             return []
     players = await db.players.find(query, {"_id": 0}).sort("name", 1).to_list(2000)
     if club_id:
-        players = [p for p in players if not p.get("club_id") or p.get("club_id") == club_id]
+        # Estricto: un jugador sin club_id ya no es visible para todos los clubes.
+        # El backfill de arranque asigna club a los documentos antiguos.
+        players = [p for p in players if p.get("club_id") == club_id]
     if coach_allowed is not None:
         players = [
             p for p in players
             if p.get("team") in coach_allowed or p.get("category") in coach_allowed
         ]
-    players = [enrich_player(p) for p in players]
+    role = user.get("role")
+    players = [mask_player_for_role(enrich_player(p), role) for p in players]
     if search:
         q = search.strip().lower()
         players = [
@@ -691,7 +883,7 @@ async def create_player(data: PlayerIn, user=Depends(require_roles("admin", "coo
     doc["created_at"] = now_iso()
     await db.players.insert_one(doc)
     doc.pop("_id", None)
-    return enrich_player(doc)
+    return mask_player_for_role(enrich_player(doc), user.get("role"))
 
 
 @api_router.put("/players/{player_id}")
@@ -711,7 +903,7 @@ async def update_player(player_id: str, data: PlayerIn, user=Depends(require_rol
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Jugador no encontrado")
     updated = await db.players.find_one({"id": player_id}, {"_id": 0})
-    return enrich_player(updated)
+    return mask_player_for_role(enrich_player(updated), user.get("role"))
 
 
 @api_router.delete("/players/{player_id}")
@@ -727,10 +919,14 @@ async def delete_player(player_id: str, user=Depends(require_roles("admin"))):
 
 
 @api_router.post("/players/{player_id}/office")
-async def update_player_office(player_id: str, data: OfficePlayerUpdateIn, user=Depends(require_roles("admin", "coordinator", "office"))):
+async def update_player_office(player_id: str, data: OfficePlayerUpdateIn, user=Depends(require_roles("admin", "office"))):
+    """Editar la ficha de oficina. Coordinación la ve, pero no la modifica."""
+    club_id = require_club_context(user)
     player = await db.players.find_one({"id": player_id}, {"_id": 0})
     if not player:
         raise HTTPException(status_code=404, detail="Jugador no encontrado")
+    if player.get("club_id") and player.get("club_id") != club_id:
+        raise HTTPException(status_code=403, detail="Ese jugador es de otro club")
     update = {}
     if data.billing is not None:
         billing = default_billing(
@@ -781,15 +977,38 @@ async def update_player_office(player_id: str, data: OfficePlayerUpdateIn, user=
                 "scholarship_notes": billing["scholarship_notes"],
                 "payment_status": billing["all_paid"],
             })
-    if not update:
+    # Tutores, cuenta bancaria y empadronamiento viven en tablas SQL propias
+    # (public.guardians / public.bank_accounts / players.empadronado).
+    office_details = {
+        "guardians": [g.model_dump() for g in data.guardians] if data.guardians is not None else None,
+        "bank": data.bank.model_dump() if data.bank is not None else None,
+        "empadronado": data.empadronado,
+    }
+    has_details = any(v is not None for v in office_details.values())
+
+    if has_details:
+        from players_store import relational_players_enabled, save_office_details
+
+        if await relational_players_enabled(db):
+            await save_office_details(db, player_id, **office_details)
+            if hasattr(db.players, "_invalidate"):
+                db.players._invalidate()
+        else:
+            # Sin plantilla SQL, se guardan en el propio documento.
+            for key, value in office_details.items():
+                if value is not None:
+                    update[key] = value
+
+    if not update and not has_details:
         raise HTTPException(status_code=400, detail="No hay cambios para aplicar")
-    await db.players.update_one({"id": player_id}, {"$set": update})
+    if update:
+        await db.players.update_one({"id": player_id}, {"$set": update})
     updated = await db.players.find_one({"id": player_id}, {"_id": 0})
-    return enrich_player(updated)
+    return mask_player_for_role(enrich_player(updated), user.get("role"))
 
 
 @api_router.post("/players/register")
-async def register_player_office(data: PlayerRegistrationIn, user=Depends(require_roles("admin", "coordinator", "office"))):
+async def register_player_office(data: PlayerRegistrationIn, user=Depends(require_roles("admin", "office"))):
     """Alta de jugador desde Oficina con cobros de matrícula, mensualidad y ropa."""
     billing = default_billing(
         payments=[p.model_dump() for p in data.payments],
@@ -819,14 +1038,9 @@ async def register_player_office(data: PlayerRegistrationIn, user=Depends(requir
         "created_by": user["id"],
         "created_by_role": user.get("role"),
     }
-    try:
-        club_id = user.get("club_id")
-        if club_id:
-            doc["club_id"] = club_id
-    except Exception:
-        pass
+    doc["club_id"] = require_club_context(user)
     await db.players.insert_one(doc)
-    return enrich_player(doc)
+    return mask_player_for_role(enrich_player(doc), user.get("role"))
 
 
 # ------------------ Import Excel/CSV ------------------
@@ -945,7 +1159,7 @@ async def import_preview(file: UploadFile = File(...), user=Depends(require_role
 
     batch_id = str(uuid.uuid4())
     await db.import_batches.insert_one({
-        "id": batch_id, "rows": rows, "errors": errors,
+        "id": batch_id, "rows": rows, "errors": errors, "club_id": user.get("club_id"),
         "created_at": now_iso(), "created_by": user["id"], "committed": False,
     })
     return {
@@ -961,14 +1175,18 @@ async def import_preview(file: UploadFile = File(...), user=Depends(require_role
 
 @api_router.post("/players/import/commit/{batch_id}")
 async def import_commit(batch_id: str, user=Depends(require_roles("admin"))):
+    club_id = require_club_context(user)
     batch = await db.import_batches.find_one({"id": batch_id}, {"_id": 0})
     if not batch:
         raise HTTPException(status_code=404, detail="Lote no encontrado")
     if batch.get("committed"):
         raise HTTPException(status_code=400, detail="Lote ya importado")
+    if batch.get("club_id") and batch.get("club_id") != club_id:
+        raise HTTPException(status_code=403, detail="Ese lote pertenece a otro club")
     to_insert = []
     for r in batch["rows"]:
         r["id"] = str(uuid.uuid4())
+        r["club_id"] = club_id
         r["created_at"] = now_iso()
         to_insert.append(r)
     if to_insert:
@@ -982,10 +1200,13 @@ async def import_commit(batch_id: str, user=Depends(require_roles("admin"))):
 async def export_players(category: Optional[str] = None, team: Optional[str] = None,
                           user=Depends(require_roles("admin", "coordinator"))):
     import pandas as pd
-    query = {}
+    club_id = require_club_context(user)
+    query = {"club_id": club_id}
     if category: query["category"] = category
     if team: query["team"] = team
     players = await db.players.find(query, {"_id": 0}).to_list(5000)
+    # Defensa en profundidad: nunca exportar jugadores de otro club.
+    players = [p for p in players if p.get("club_id") == club_id]
     df = pd.DataFrame([enrich_player(p) for p in players])
     if df.empty:
         df = pd.DataFrame(columns=["name", "dni", "category", "team", "payment_status", "insurance_expiry"])
@@ -1110,14 +1331,14 @@ async def save_attendance(data: AttendanceIn, user=Depends(require_roles("coach"
     doc["id"] = str(uuid.uuid4())
     doc["coach_id"] = user["id"]
     doc["created_at"] = now_iso()
-    await db.attendance.insert_one(doc)
+    await db.attendance.insert_one(stamped(user, doc))
     doc.pop("_id", None)
     return doc
 
 
 @api_router.get("/attendance")
 async def list_attendance(team: Optional[str] = None, user=Depends(get_current_user)):
-    q = {}
+    q = scoped(user)
     if team:
         q["team"] = team
     return await db.attendance.find(q, {"_id": 0}).sort("date", -1).to_list(500)
@@ -1218,6 +1439,7 @@ async def save_minutes(data: MinutesIn, user=Depends(require_roles("coach", "coo
     doc = data.model_dump()
     doc["id"] = str(uuid.uuid4())
     doc["coach_id"] = user["id"]
+    doc["club_id"] = require_club_context(user)
     doc["created_at"] = now_iso()
     # low-minutes alert
     alerts = []
@@ -1245,12 +1467,12 @@ async def save_minutes(data: MinutesIn, user=Depends(require_roles("coach", "coo
 
 @api_router.get("/minutes")
 async def list_minutes(user=Depends(get_current_user)):
-    return await db.minutes.find({}, {"_id": 0}).sort("date", -1).to_list(500)
+    return await db.minutes.find(scoped(user), {"_id": 0}).sort("date", -1).to_list(500)
 
 
 @api_router.get("/coordinator/alerts")
 async def coord_alerts(user=Depends(require_roles("coordinator", "admin"))):
-    alerts = await db.coordinator_alerts.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    alerts = await db.coordinator_alerts.find(scoped(user), {"_id": 0}).sort("created_at", -1).to_list(200)
     id_to_name = {p["id"]: p["name"] async for p in db.players.find({}, {"_id": 0, "id": 1, "name": 1})}
     for a in alerts:
         a["player_name"] = id_to_name.get(a.get("player_id"), a.get("player_id"))
@@ -1353,10 +1575,15 @@ async def set_injury(data: InjuryIn, user=Depends(require_roles("coach", "coordi
 
 @api_router.get("/injuries")
 async def list_injuries(team: Optional[str] = None, status: Optional[str] = None, user=Depends(get_current_user)):
+    club_id = require_club_context(user)
     items = await _load_injury_cases()
-    players = await db.players.find({}, {"_id": 0}).to_list(5000)
+    players = await db.players.find({"club_id": club_id}, {"_id": 0}).to_list(5000)
     player_lookup = {p["id"]: p for p in players}
-    enriched = [_normalize_injury_case(item, player_lookup) for item in items]
+    # Solo lesiones de jugadores de este club.
+    enriched = [
+        _normalize_injury_case(item, player_lookup) for item in items
+        if item.get("player_id") in player_lookup
+    ]
     if user.get("role") in {"coach", "physio"} and user.get("assigned_teams"):
         allowed = set(user.get("assigned_teams") or [])
         enriched = [
@@ -1897,7 +2124,7 @@ api_router.include_router(_clubs_routes.router)
 # ------------------ Inventory ------------------
 @api_router.get("/inventory")
 async def list_inventory(user=Depends(get_current_user)):
-    q = {}
+    q = scoped(user)
     if user["role"] == "coach":
         q["$or"] = [{"assigned_to_user_id": user["id"]}, {"assigned_to_team": {"$in": user.get("assigned_teams", [])}}]
     items = await db.inventory.find(q, {"_id": 0}).sort("item", 1).to_list(500)
@@ -1907,21 +2134,21 @@ async def list_inventory(user=Depends(get_current_user)):
 
 
 @api_router.post("/inventory")
-async def create_inventory(data: InventoryItemIn, user=Depends(require_roles("admin", "office", "coordinator"))):
+async def create_inventory(data: InventoryItemIn, user=Depends(require_roles("admin", "office"))):
     doc = data.model_dump()
     doc["id"] = str(uuid.uuid4())
     doc["created_at"] = now_iso()
     doc["updated_at"] = now_iso()
     doc["confirmations"] = []
     doc["stock_priority"] = stock_priority(doc.get("quantity") or 0)
-    await db.inventory.insert_one(doc)
+    await db.inventory.insert_one(stamped(user, doc))
     doc.pop("_id", None)
     return doc
 
 
 @api_router.put("/inventory/{item_id}")
-async def update_inventory(item_id: str, data: InventoryUpdateIn, user=Depends(require_roles("admin", "office", "coordinator"))):
-    existing = await db.inventory.find_one({"id": item_id}, {"_id": 0})
+async def update_inventory(item_id: str, data: InventoryUpdateIn, user=Depends(require_roles("admin", "office"))):
+    existing = await db.inventory.find_one(scoped(user, {"id": item_id}), {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Item no encontrado")
     update = {k: v for k, v in data.model_dump().items() if v is not None}
@@ -1983,7 +2210,7 @@ async def list_player_kits(
 
 
 @api_router.put("/player-kits/{player_id}")
-async def upsert_player_kit(player_id: str, data: PlayerKitIn, user=Depends(require_roles("admin", "coordinator", "office"))):
+async def upsert_player_kit(player_id: str, data: PlayerKitIn, user=Depends(require_roles("admin", "office"))):
     player = await db.players.find_one({"id": player_id}, {"_id": 0})
     if not player:
         raise HTTPException(status_code=404, detail="Jugador no encontrado")
@@ -2026,19 +2253,19 @@ async def create_incident(data: IncidentIn, user=Depends(get_current_user)):
     doc["reporter_name"] = user.get("name", "")
     doc["status"] = "abierta"
     doc["created_at"] = now_iso()
-    await db.incidents.insert_one(doc)
+    await db.incidents.insert_one(stamped(user, doc))
     doc.pop("_id", None)
     return doc
 
 
 @api_router.get("/incidents")
 async def list_incidents(user=Depends(get_current_user)):
-    return await db.incidents.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return await db.incidents.find(scoped(user), {"_id": 0}).sort("created_at", -1).to_list(500)
 
 
 @api_router.post("/incidents/{incident_id}/resolve")
 async def resolve_incident(incident_id: str, user=Depends(require_roles("admin"))):
-    result = await db.incidents.update_one({"id": incident_id}, {"$set": {"status": "resuelta", "resolved_at": now_iso()}})
+    result = await db.incidents.update_one(scoped(user, {"id": incident_id}), {"$set": {"status": "resuelta", "resolved_at": now_iso()}})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Incidencia no encontrada")
     return {"ok": True}
@@ -2061,7 +2288,7 @@ async def dashboard_stats(user=Depends(get_current_user)):
     )
 
     if user.get("club_id"):
-        players = [p for p in players if not p.get("club_id") or p.get("club_id") == user["club_id"]]
+        players = [p for p in players if p.get("club_id") == user["club_id"]]
     total = len(players)
     morosos = sum(1 for p in players if not p.get("payment_status"))
     attention_count = sum(1 for p in players if player_has_attention(p))
@@ -2149,19 +2376,20 @@ async def root():
 
 # ------------------ Startup: seed admin + demo data ------------------
 async def seed_admin():
-    from players_store import top_teams_for_coach_seed
-
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@sportink.app").lower()
-    admin_password = os.environ.get("ADMIN_PASSWORD", "Sportink2026!")
-    coach_teams = await top_teams_for_coach_seed(db, limit=4)
-    for email, name, role, password, assigned_teams in [
-        (admin_email, "Dirección", "admin", admin_password, []),
-        ("coordinador@sportink.app", "Carlos Coordinador", "coordinator", "Sportink2026!", []),
-        ("entrenador@sportink.app", "Luis Entrenador", "coach", "Sportink2026!", coach_teams),
-        ("oficina@sportink.app", "Paqui Oficina", "office", "Sportink2026!", []),
-        ("fisio@sportink.app", "Fisio Club", "physio", "Sportink2026!", []),
-        ("iscastilow@gmail.com", "Is Castilow", "admin", "Dios2090.", []),
-    ]:
+    admin_password = (os.environ.get("ADMIN_PASSWORD") or "").strip()
+
+    # Solo la cuenta de dirección, y solo con contraseña de entorno.
+    # No hay cuentas demo: se dan de alta desde Usuarios como cualquier otra.
+    accounts: list[tuple] = []
+    if admin_password:
+        accounts.append((admin_email, "Dirección", "admin", admin_password, []))
+    else:
+        logger.warning(
+            "ADMIN_PASSWORD no definida: se omite el alta de la cuenta de dirección."
+        )
+
+    for email, name, role, password, assigned_teams in accounts:
         existing_user = await db.users.find_one({"email": email})
         user_id = existing_user["id"] if existing_user else str(uuid.uuid4())
         auth_user = ensure_supabase_staff_user(
@@ -2432,6 +2660,60 @@ async def backfill_player_entities():
         logger.warning("backfill_player_entities omitido: %s", exc)
 
 
+async def backfill_user_club_ids():
+    """Asigna el club por defecto a usuarios antiguos sin club_id.
+
+    /users pasó a filtrar por club de forma estricta; sin esto, la pantalla
+    de Usuarios aparecería vacía para todo el mundo.
+    """
+    from deps import _fetch_default_club_id
+
+    try:
+        default_club = await _fetch_default_club_id()
+        if not default_club:
+            return
+        users = await db.users.find({}, {"_id": 0}).to_list(1000)
+        pending = [u for u in users if not u.get("club_id")]
+        for u in pending:
+            await db.users.update_one({"id": u["id"]}, {"$set": {"club_id": default_club}})
+        if pending:
+            logger.info("backfill_user_club_ids: %d usuarios asignados al club por defecto", len(pending))
+    except Exception as exc:
+        logger.warning("backfill_user_club_ids omitido: %s", exc)
+
+
+async def backfill_player_club_ids():
+    """Asigna club al club por defecto a jugadores antiguos sin club_id.
+
+    Necesario porque el filtro de /players pasó a ser estricto: antes, un
+    jugador sin club_id era visible para TODOS los clubes (fail-open).
+    """
+    from deps import _fetch_default_club_id
+    from players_store import relational_players_enabled
+
+    try:
+        if await relational_players_enabled(db):
+            return
+    except Exception as exc:
+        logger.warning("backfill_player_club_ids omitido (SQL): %s", exc)
+        return
+    try:
+        default_club = await _fetch_default_club_id()
+        if not default_club:
+            logger.warning("backfill_player_club_ids: no hay club por defecto")
+            return
+        players = await db.players.find({}, {"_id": 0}).to_list(5000)
+        pending = [p for p in players if not p.get("club_id")]
+        for player in pending:
+            await db.players.update_one(
+                {"id": player["id"]}, {"$set": {"club_id": default_club}}
+            )
+        if pending:
+            logger.info("backfill_player_club_ids: %d jugadores asignados al club por defecto", len(pending))
+    except Exception as exc:
+        logger.warning("backfill_player_club_ids omitido: %s", exc)
+
+
 @app.on_event("startup")
 async def _startup():
     await db.users.create_index("email", unique=True)
@@ -2441,6 +2723,8 @@ async def _startup():
     await db.chat_messages.create_index([("room_id", 1), ("created_at", 1)])
     init_storage()
     await backfill_player_entities()
+    await backfill_player_club_ids()
+    await backfill_user_club_ids()
     from players_store import relational_players_enabled
 
     try:
@@ -2491,10 +2775,12 @@ if _cors_raw and _cors_raw != '*':
     _cors_origins = list(dict.fromkeys(
         _cors_origins + [o.strip().rstrip('/') for o in _cors_raw.split(',') if o.strip()]
     ))
-# Vercel (prod + previews) y Emergent: el login con cookies necesita el Origin exacto.
-_allow_origin_regex = (
-    r"^https://([a-z0-9-]+\.)*(vercel\.app|preview\.emergentagent\.com|emergentagent\.com)$"
-)
+# Previews de Vercel: ancladas AL PROYECTO, no a todo vercel.app.
+# El regex anterior (`([a-z0-9-]+\.)*vercel\.app`) aceptaba credenciales desde
+# CUALQUIER despliegue de Vercel — que cualquiera puede crear gratis —, lo que
+# permitía leer y escribir la API en nombre de un usuario con sesión abierta.
+_vercel_project = os.environ.get("VERCEL_PROJECT_SLUG", "sportinksoft").strip()
+_allow_origin_regex = rf"^https://{_vercel_project}(-[a-z0-9-]+)?\.vercel\.app$"
 
 app.add_middleware(
     CORSMiddleware,

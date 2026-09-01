@@ -15,7 +15,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 
 from deps import (
     db, now_iso, uuid, APP_NAME, MAX_UPLOAD_BYTES,
-    get_current_user, require_roles, put_object, get_object,
+    get_current_user, require_roles, require_club_context, put_object, get_object,
 )
 
 router = APIRouter()
@@ -62,6 +62,7 @@ async def _sync_captacion_destacados(match_doc: dict, user: dict) -> None:
             "created_by": user["id"],
             "created_by_name": user.get("name", ""),
         }
+        entry["club_id"] = require_club_context(user)
         await db.captacion_entries.insert_one(entry)
 
 
@@ -107,6 +108,11 @@ class MatchSheetIn(BaseModel):
     group: str = ""
     match_date: str
     result: str = ""
+    # Duración del partido para calcular el % de minutos de cada jugador.
+    # Sin esto la hoja de partido no alimentaba las alertas de coordinación:
+    # los minutos vivían en un endpoint aparte (/minutes) que la interfaz del
+    # entrenador no llegaba a usar.
+    total_match_minutes: int = 0
     starters: List[dict] = []
     substitutes: List[dict] = []
     outstanding_club: List[dict] = []
@@ -161,6 +167,8 @@ async def create_training_sheet(data: TrainingSheetIn, user=Depends(require_role
     doc["coach_name"] = user.get("name", "")
     doc["created_at"] = now_iso()
     doc["status"] = "enviada"
+    doc["kind"] = "entrenamiento"
+    doc["club_id"] = require_club_context(user)
     await db.training_sheets.insert_one(doc)
     doc.pop("_id", None)
     return doc
@@ -168,7 +176,7 @@ async def create_training_sheet(data: TrainingSheetIn, user=Depends(require_role
 
 @router.get("/training-sheets")
 async def list_training_sheets(team: Optional[str] = None, user=Depends(get_current_user)):
-    q = {}
+    q = {"club_id": require_club_context(user)}
     if team:
         q["team"] = team
     if user.get("role") == "coach":
@@ -187,6 +195,24 @@ async def training_photo(sheet_id: str, request: Request):
 
 
 # ------------------ Match sheets ------------------
+LOW_MINUTES_PCT = 30
+
+
+def _match_sheet_minutes(doc: dict) -> list[dict]:
+    """Minutos por jugador a partir de titulares y suplentes de la hoja."""
+    out = []
+    for row in (doc.get("starters") or []) + (doc.get("substitutes") or []):
+        pid = row.get("player_id") or row.get("id")
+        if not pid:
+            continue
+        try:
+            minutes = int(row.get("minutes") or 0)
+        except (TypeError, ValueError):
+            minutes = 0
+        out.append({"player_id": pid, "name": row.get("name", ""), "minutes": minutes})
+    return out
+
+
 @router.post("/match-sheets")
 async def create_match_sheet(data: MatchSheetIn, user=Depends(require_roles("coach", "coordinator", "admin"))):
     doc = data.model_dump()
@@ -195,7 +221,59 @@ async def create_match_sheet(data: MatchSheetIn, user=Depends(require_roles("coa
     doc["coach_name"] = user.get("name", "")
     doc["created_at"] = now_iso()
     doc["status"] = "enviada"
+    # Campo común con las hojas de entrenamiento para poder listarlas juntas
+    # y ordenarlas por fecha (entrenamiento usa "date", partido "match_date").
+    doc["date"] = data.match_date
+    doc["kind"] = "partido"
+
+    minutes_rows = _match_sheet_minutes(doc)
+    total = int(doc.get("total_match_minutes") or 0)
+    doc["minutes_records"] = minutes_rows
+    doc["minutes_total_played"] = sum(r["minutes"] for r in minutes_rows)
+
+    doc["club_id"] = require_club_context(user)
     await db.match_sheets.insert_one(doc)
+
+    # Registro de minutos para /stats y el panel de coordinación. Antes lo
+    # enviaba el frontend en una segunda petición a /minutes dentro de un
+    # try/catch: si fallaba, la hoja quedaba guardada y las alertas no salían,
+    # sin que nadie se enterara. Ahora va en la misma petición.
+    if total > 0 and minutes_rows:
+        await db.minutes.insert_one({
+            "id": str(uuid.uuid4()),
+            "date": data.match_date,
+            "team": data.team,
+            "category": data.category,
+            "opponent": data.opponent,
+            "total_match_minutes": total,
+            "records": minutes_rows,
+            "coach_id": user["id"],
+            "match_sheet_id": doc["id"],
+            "created_at": now_iso(),
+        })
+
+    # Alertas de pocos minutos para coordinación: por debajo del 30 %.
+    if total > 0 and minutes_rows:
+        alerts = [
+            {"player_id": r["player_id"], "pct": round(r["minutes"] / total * 100, 1)}
+            for r in minutes_rows
+            if (r["minutes"] / total * 100) < LOW_MINUTES_PCT
+        ]
+        for a in alerts:
+            await db.coordinator_alerts.insert_one({
+                "id": str(uuid.uuid4()),
+                "type": "low_minutes",
+                "player_id": a["player_id"],
+                "pct": a["pct"],
+                "match_date": data.match_date,
+                "team": data.team,
+                "source": "match_sheet",
+                "match_sheet_id": doc["id"],
+                "created_at": now_iso(),
+                "read": False,
+            })
+        doc["alerts"] = alerts
+
     await _sync_captacion_destacados(doc, user)
     doc.pop("_id", None)
     return doc
@@ -203,7 +281,7 @@ async def create_match_sheet(data: MatchSheetIn, user=Depends(require_roles("coa
 
 @router.get("/match-sheets")
 async def list_match_sheets(team: Optional[str] = None, user=Depends(get_current_user)):
-    q = {}
+    q = {"club_id": require_club_context(user)}
     if team:
         q["team"] = team
     if user.get("role") == "coach":
@@ -374,7 +452,61 @@ async def delete_captacion_entry(entry_id: str, user=Depends(require_roles("admi
     return {"ok": True}
 
 
+@router.get("/sheets")
+async def list_all_sheets(
+    date: Optional[str] = None,
+    team: Optional[str] = None,
+    user=Depends(get_current_user),
+):
+    """Hojas de entrenamiento y de partido juntas, ordenadas por fecha.
+
+    Las dos colecciones guardaban la fecha con nombres distintos ("date" y
+    "match_date"), así que no había forma de verlas en un mismo listado.
+    """
+    q = {"club_id": require_club_context(user)}
+    if team:
+        q["team"] = team
+    if user.get("role") == "coach":
+        q["coach_id"] = user["id"]
+
+    trainings, matches = await asyncio.gather(
+        db.training_sheets.find(q, {"_id": 0}).to_list(500),
+        db.match_sheets.find(q, {"_id": 0}).to_list(500),
+    )
+
+    items = []
+    for t in trainings:
+        items.append({**t, "kind": t.get("kind") or "entrenamiento", "date": t.get("date") or ""})
+    for m in matches:
+        items.append({
+            **m,
+            "kind": m.get("kind") or "partido",
+            # Las hojas antiguas no tienen "date": se deriva de match_date.
+            "date": m.get("date") or m.get("match_date") or "",
+        })
+
+    if date:
+        items = [i for i in items if i.get("date") == date]
+
+    items.sort(key=lambda i: (i.get("date") or "", i.get("created_at") or ""), reverse=True)
+    return items
+
+
 # ------------------ Convocations ------------------
+def build_convocation_text(data, names: list[str]) -> str:
+    """Texto de la convocatoria listo para pegar en WhatsApp."""
+    home_away = "LOCAL" if data.is_home else "VISITANTE"
+    return (
+        f"📣 CONVOCATORIA · {data.match_date} {data.match_time}\n"
+        f"{home_away}: {data.team} vs {data.opponent}\n"
+        f"{data.venue}\n"
+        + (f"⏰ Citación: {data.meeting_time} en {data.meeting_place}\n" if data.meeting_time else "")
+        + (f"📝 {data.notes}\n" if data.notes else "")
+        + f"\nConvocados ({len(names)}):\n"
+        + "\n".join(f"• {n}" for n in names)
+    )
+
+
 @router.post("/convocations")
 async def create_convocation(data: ConvocationIn, user=Depends(require_roles("coach", "coordinator", "admin"))):
     doc = data.model_dump()
@@ -382,37 +514,29 @@ async def create_convocation(data: ConvocationIn, user=Depends(require_roles("co
     doc["coach_id"] = user["id"]
     doc["coach_name"] = user.get("name", "")
     doc["created_at"] = now_iso()
+    doc["club_id"] = require_club_context(user)
     await db.convocations.insert_one(doc)
 
-    # Auto-post to team chat if room exists
-    room = await db.team_rooms.find_one({"team": data.team})
-    if room:
-        called_ids = {r["player_id"] for r in data.records if r.get("called")}
-        players = await db.players.find({"id": {"$in": list(called_ids)}}, {"_id": 0, "id": 1, "name": 1}).to_list(200)
-        names = sorted([p["name"] for p in players])
-        home_away = "LOCAL" if data.is_home else "VISITANTE"
-        msg = (f"📣 CONVOCATORIA · {data.match_date} {data.match_time}\n"
-               f"{home_away}: CF Rayo Majadahonda vs {data.opponent}\n"
-               f"{data.venue}\n"
-               + (f"⏰ Citación: {data.meeting_time} en {data.meeting_place}\n" if data.meeting_time else "")
-               + (f"📝 {data.notes}\n" if data.notes else "")
-               + f"\nConvocados ({len(names)}):\n" + "\n".join(f"• {n}" for n in names))
-        await db.chat_messages.insert_one({
-            "id": str(uuid.uuid4()),
-            "room_id": room["id"],
-            "author_name": user.get("name", "Entrenador"),
-            "author_role": "coach",
-            "text": msg,
-            "kind": "convocation",
-            "created_at": now_iso(),
-        })
+    # Texto para WhatsApp: el club ya no usa el chat interno, así que en vez de
+    # publicarlo en la sala se devuelve para que el entrenador lo copie.
+    called_ids = {r["player_id"] for r in data.records if r.get("called")}
+    called_players = await db.players.find(
+        {"id": {"$in": list(called_ids)}}, {"_id": 0, "id": 1, "name": 1}
+    ).to_list(200) if called_ids else []
+    names = sorted([p["name"] for p in called_players])
+    whatsapp_text = build_convocation_text(data, names)
+
+    await db.convocations.update_one(
+        {"id": doc["id"]}, {"$set": {"whatsapp_text": whatsapp_text}}
+    )
+    doc["whatsapp_text"] = whatsapp_text
     doc.pop("_id", None)
     return doc
 
 
 @router.get("/convocations")
 async def list_convocations(team: Optional[str] = None, user=Depends(get_current_user)):
-    q = {}
+    q = {"club_id": require_club_context(user)}
     if team:
         q["team"] = team
     if user.get("role") == "coach":

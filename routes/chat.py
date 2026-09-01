@@ -7,7 +7,8 @@ from pydantic import BaseModel
 
 from deps import (
     db, now_iso, _slug, _secrets, uuid,
-    get_current_user, require_roles, _parent_or_staff, rate_limit_ip,
+    get_current_user,
+    require_club_context, require_roles, _parent_or_staff, rate_limit_ip,
     create_parent_chat_session,
 )
 
@@ -53,6 +54,7 @@ async def create_chat_room(data: ChatRoomIn, user=Depends(require_roles("coach",
     room = {
         "id": str(uuid.uuid4()), "team": data.team,
         "slug": slug, "created_by": user["id"], "created_at": now_iso(),
+        "club_id": require_club_context(user),
     }
     await db.team_rooms.insert_one(room)
     room.pop("_id", None)
@@ -61,7 +63,7 @@ async def create_chat_room(data: ChatRoomIn, user=Depends(require_roles("coach",
 
 @router.get("/chat/rooms")
 async def list_chat_rooms(user=Depends(get_current_user)):
-    q = {}
+    q = {"club_id": require_club_context(user)}
     if user.get("role") == "coach":
         allowed = user.get("assigned_teams") or []
         q["team"] = {"$in": allowed}

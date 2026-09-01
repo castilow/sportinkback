@@ -61,6 +61,35 @@ def sql_row_to_player(row: dict) -> dict:
         "phone": row.get("telefono") or "",
         "email": row.get("email") or "",
         "notes": row.get("notas") or "",
+        "empadronado": bool(row.get("empadronado")),
+        # Tutores (padre/madre). orden 1 y 2 en public.guardians.
+        "guardians": [
+            g for g in (
+                {
+                    "orden": 1,
+                    "nombre": row.get("tutor1_nombre") or "",
+                    "dni": row.get("tutor1_dni") or "",
+                    "telefono": row.get("tutor1_telefono") or "",
+                    "email": row.get("tutor1_email") or "",
+                    "titular_pago": bool(row.get("tutor1_titular_pago")),
+                } if row.get("tutor1_nombre") else None,
+                {
+                    "orden": 2,
+                    "nombre": row.get("tutor2_nombre") or "",
+                    "dni": row.get("tutor2_dni") or "",
+                    "telefono": row.get("tutor2_telefono") or "",
+                    "email": row.get("tutor2_email") or "",
+                    "titular_pago": bool(row.get("tutor2_titular_pago")),
+                } if row.get("tutor2_nombre") else None,
+            ) if g
+        ],
+        # El IBAN se enmascara por rol en la capa API (mask_player_for_role).
+        "bank": {
+            "entidad": row.get("banco_entidad") or "",
+            "titular": row.get("banco_titular") or "",
+            "iban": row.get("banco_iban") or "",
+            "paga_en_tienda": bool(row.get("paga_en_tienda")),
+        },
         "created_at": row.get("created_at"),
         # Evitar semáforo rojo por fechas no importadas del Excel
         "insurance_semaforo": "green",
@@ -99,17 +128,44 @@ select
   p.club_id::text as club_id,
   p.team_id::text as team_id,
   p.notas,
+  p.empadronado,
   p.created_at::text as created_at,
   g.telefono,
   g.email,
+  g.nombre as tutor1_nombre,
+  g.dni as tutor1_dni,
+  g.telefono as tutor1_telefono,
+  g.email as tutor1_email,
+  g.es_titular_pago as tutor1_titular_pago,
+  g2.nombre as tutor2_nombre,
+  g2.dni as tutor2_dni,
+  g2.telefono as tutor2_telefono,
+  g2.email as tutor2_email,
+  g2.es_titular_pago as tutor2_titular_pago,
+  bank.entidad as banco_entidad,
+  bank.titular as banco_titular,
+  bank.iban as banco_iban,
+  bank.paga_en_tienda as paga_en_tienda,
   coalesce(pay.has_debt, false) as has_debt
 from public.players p
 left join lateral (
-  select telefono, email
+  select nombre, dni, telefono, email, es_titular_pago
   from public.guardians g
   where g.player_id = p.id and g.orden = 1
   limit 1
 ) g on true
+left join lateral (
+  select nombre, dni, telefono, email, es_titular_pago
+  from public.guardians g2
+  where g2.player_id = p.id and g2.orden = 2
+  limit 1
+) g2 on true
+left join lateral (
+  select entidad, titular, iban, paga_en_tienda
+  from public.bank_accounts ba
+  where ba.player_id = p.id and ba.temporada = p.temporada
+  limit 1
+) bank on true
 left join lateral (
   select bool_or(pay.estado = 'por_pagar') as has_debt
   from public.payments pay
@@ -467,6 +523,90 @@ async def top_teams_for_coach_seed(db: Any, limit: int = 3) -> list[str]:
         return teams or ["DEBUTANTES 1", "ALEVINES 2"]
     except Exception:
         return ["DEBUTANTES 1", "ALEVINES 2"]
+
+
+async def save_office_details(
+    db: Any,
+    player_id: str,
+    *,
+    guardians: Optional[list] = None,
+    bank: Optional[dict] = None,
+    empadronado: Optional[bool] = None,
+) -> None:
+    """Guarda tutores, cuenta bancaria y empadronamiento en las tablas SQL.
+
+    guardians: lista de dicts con orden (1|2), nombre, dni, telefono, email,
+    titular_pago. Un tutor con nombre vacío se elimina.
+    """
+    pid = _sql_literal(player_id)
+
+    if empadronado is not None:
+        await db.execute(
+            f"update public.players set empadronado = {str(bool(empadronado)).lower()}, "
+            f"updated_at = now() where id = {pid}::uuid;"
+        )
+
+    for g in guardians or []:
+        try:
+            orden = int(g.get("orden") or 0)
+        except (TypeError, ValueError):
+            continue
+        if orden not in (1, 2):
+            continue
+        nombre = (g.get("nombre") or "").strip()
+        if not nombre:
+            await db.execute(
+                f"delete from public.guardians where player_id = {pid}::uuid and orden = {orden};"
+            )
+            continue
+        await db.execute(
+            f"""
+            insert into public.guardians (player_id, orden, nombre, dni, telefono, email, es_titular_pago)
+            values (
+              {pid}::uuid, {orden},
+              {_sql_literal(nombre)},
+              {_sql_literal((g.get('dni') or '').strip() or None)},
+              {_sql_literal((g.get('telefono') or '').strip() or None)},
+              {_sql_literal((g.get('email') or '').strip() or None)},
+              {str(bool(g.get('titular_pago'))).lower()}
+            )
+            on conflict (player_id, orden) do update set
+              nombre = excluded.nombre,
+              dni = excluded.dni,
+              telefono = excluded.telefono,
+              email = excluded.email,
+              es_titular_pago = excluded.es_titular_pago;
+            """
+        )
+
+    if bank is not None:
+        iban = (bank.get("iban") or "").replace(" ", "").strip()
+        entidad = (bank.get("entidad") or "").strip()
+        titular = (bank.get("titular") or "").strip()
+        if not (iban or entidad or titular):
+            await db.execute(
+                f"delete from public.bank_accounts where player_id = {pid}::uuid "
+                f"and temporada = {_sql_literal(TEMPORADA)};"
+            )
+        else:
+            await db.execute(
+                f"""
+                insert into public.bank_accounts (player_id, entidad, titular, iban, paga_en_tienda, temporada)
+                values (
+                  {pid}::uuid,
+                  {_sql_literal(entidad or None)},
+                  {_sql_literal(titular or None)},
+                  {_sql_literal(iban or None)},
+                  {str(bool(bank.get('paga_en_tienda'))).lower()},
+                  {_sql_literal(TEMPORADA)}
+                )
+                on conflict (player_id, temporada) do update set
+                  entidad = excluded.entidad,
+                  titular = excluded.titular,
+                  iban = excluded.iban,
+                  paga_en_tienda = excluded.paga_en_tienda;
+                """
+            )
 
 
 def install_players_store(db: Any) -> Any:
