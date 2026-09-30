@@ -446,7 +446,7 @@ def stock_priority(quantity: int) -> str:
     return "low"
 
 
-async def deduct_inventory_for_kit_delivery(previous_items: List[dict], next_items: List[dict]):
+async def deduct_inventory_for_kit_delivery(previous_items: List[dict], next_items: List[dict], club_id: str):
     """Descuenta stock de ropa al pasar prendas a 'entregado'."""
     prev_map = {item.get("code"): item for item in (previous_items or [])}
     for item in next_items or []:
@@ -459,7 +459,7 @@ async def deduct_inventory_for_kit_delivery(previous_items: List[dict], next_ite
         qty = max(1, int(item.get("quantity") or 1))
         size = (item.get("size") or "").strip()
         candidates = await db.inventory.find(
-            {"category": "ropa", "sku": code},
+            {"category": "ropa", "sku": code, "club_id": club_id},
             {"_id": 0},
         ).to_list(50)
         if size:
@@ -470,7 +470,7 @@ async def deduct_inventory_for_kit_delivery(previous_items: List[dict], next_ite
             # Fallback: match by item name containing label
             label = (item.get("label") or code).lower()
             candidates = [
-                c for c in await db.inventory.find({"category": "ropa"}, {"_id": 0}).to_list(200)
+                c for c in await db.inventory.find({"category": "ropa", "club_id": club_id}, {"_id": 0}).to_list(200)
                 if label in (c.get("item") or "").lower() or code in (c.get("item") or "").lower()
             ]
         if not candidates:
@@ -478,7 +478,7 @@ async def deduct_inventory_for_kit_delivery(previous_items: List[dict], next_ite
         target = sorted(candidates, key=lambda c: int(c.get("quantity") or 0), reverse=True)[0]
         new_qty = max(0, int(target.get("quantity") or 0) - qty)
         await db.inventory.update_one(
-            {"id": target["id"]},
+            {"id": target["id"], "club_id": club_id},
             {"$set": {"quantity": new_qty, "updated_at": now_iso()}},
         )
 
@@ -892,7 +892,7 @@ async def update_player(player_id: str, data: PlayerIn, user=Depends(require_rol
     existing = await db.players.find_one({"id": player_id}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Jugador no encontrado")
-    if existing.get("club_id") and existing.get("club_id") != club_id:
+    if existing.get("club_id") != club_id:
         raise HTTPException(status_code=403, detail="No puedes modificar jugadores de otro club")
     doc = data.model_dump()
     resolved_team_id, resolved_team = await _resolve_team_name(club_id, doc.get("team_id"), doc.get("team") or "")
@@ -912,7 +912,7 @@ async def delete_player(player_id: str, user=Depends(require_roles("admin"))):
     existing = await db.players.find_one({"id": player_id}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Jugador no encontrado")
-    if existing.get("club_id") and existing.get("club_id") != club_id:
+    if existing.get("club_id") != club_id:
         raise HTTPException(status_code=403, detail="No puedes borrar jugadores de otro club")
     await db.players.delete_one({"id": player_id})
     return {"ok": True}
@@ -925,7 +925,7 @@ async def update_player_office(player_id: str, data: OfficePlayerUpdateIn, user=
     player = await db.players.find_one({"id": player_id}, {"_id": 0})
     if not player:
         raise HTTPException(status_code=404, detail="Jugador no encontrado")
-    if player.get("club_id") and player.get("club_id") != club_id:
+    if player.get("club_id") != club_id:
         raise HTTPException(status_code=403, detail="Ese jugador es de otro club")
     update = {}
     if data.billing is not None:
@@ -1230,11 +1230,11 @@ async def monthly_report(user=Depends(require_roles("admin", "coordinator"))):
     from reportlab.lib.units import cm
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
-    players = await db.players.find({}, {"_id": 0}).to_list(5000)
+    players = await db.players.find(scoped(user), {"_id": 0}).to_list(5000)
     morosos = [p for p in players if not p.get("payment_status")]
     today = date.today()
     month_start = today.replace(day=1)
-    attendance = await db.attendance.find({"date": {"$gte": month_start.isoformat()}}, {"_id": 0}).to_list(2000)
+    attendance = await db.attendance.find(scoped(user, {"date": {"$gte": month_start.isoformat()}}), {"_id": 0}).to_list(2000)
 
     attendance_counts = {}
     for a in attendance:
@@ -1252,7 +1252,7 @@ async def monthly_report(user=Depends(require_roles("admin", "coordinator"))):
     styles = getSampleStyleSheet()
     title = ParagraphStyle("T", parent=styles["Heading1"], textColor=colors.HexColor("#003366"))
     story = [
-        Paragraph(f"CF Rayo Majadahonda — Informe mensual ({today.strftime('%B %Y')})", title),
+        Paragraph(f"Informe mensual ({today.strftime('%B %Y')})", title),
         Spacer(1, 0.4*cm),
         Paragraph(f"Total jugadores: <b>{len(players)}</b> · Morosos: <b style='color:#ED1C24'>{len(morosos)}</b>", styles["Normal"]),
         Spacer(1, 0.6*cm),
@@ -1301,7 +1301,7 @@ async def monthly_report(user=Depends(require_roles("admin", "coordinator"))):
 # ------------------ Reminders (MOCK) ------------------
 @api_router.post("/reminders/send")
 async def send_reminder(data: ReminderSendIn, user=Depends(require_roles("admin", "coordinator"))):
-    player = await db.players.find_one({"id": data.player_id}, {"_id": 0})
+    player = await db.players.find_one(scoped(user, {"id": data.player_id}), {"_id": 0})
     if not player:
         raise HTTPException(status_code=404, detail="Jugador no encontrado")
     log = {
@@ -1309,19 +1309,19 @@ async def send_reminder(data: ReminderSendIn, user=Depends(require_roles("admin"
         "player_id": data.player_id,
         "player_name": player["name"],
         "channel": data.channel,
-        "message": data.message or f"Hola {player['name']}, te recordamos que tu pago del club CF Rayo Majadahonda está pendiente.",
+        "message": data.message or f"Hola {player['name']}, te recordamos que tu pago del club está pendiente.",
         "sent_by": user["id"],
         "sent_at": now_iso(),
         "status": "enviado (MOCK)",
     }
-    await db.reminders.insert_one(log)
+    await db.reminders.insert_one(stamped(user, log))
     log.pop("_id", None)
     return log
 
 
 @api_router.get("/reminders")
 async def list_reminders(user=Depends(require_roles("admin", "coordinator"))):
-    return await db.reminders.find({}, {"_id": 0}).sort("sent_at", -1).to_list(200)
+    return await db.reminders.find(scoped(user), {"_id": 0}).sort("sent_at", -1).to_list(200)
 
 
 # ------------------ Attendance (coach) ------------------
@@ -1364,7 +1364,7 @@ async def attendance_report(
         start = today - timedelta(days=today.weekday())
         end = today
 
-    sessions = await db.attendance.find({}, {"_id": 0}).sort("date", -1).to_list(2000)
+    sessions = await db.attendance.find(scoped(user), {"_id": 0}).sort("date", -1).to_list(2000)
     filtered = []
     for session in sessions:
         try:
@@ -1377,7 +1377,7 @@ async def attendance_report(
             continue
         filtered.append(session)
 
-    players = await db.players.find({}, {"_id": 0, "id": 1, "name": 1}).to_list(5000)
+    players = await db.players.find(scoped(user), {"_id": 0, "id": 1, "name": 1}).to_list(5000)
     names = {p["id"]: p.get("name", p["id"]) for p in players}
 
     by_team: dict = {}
@@ -1518,7 +1518,7 @@ def _normalize_injury_case(case: dict, player_lookup: dict) -> dict:
 
 @api_router.post("/injuries")
 async def set_injury(data: InjuryIn, user=Depends(require_roles("coach", "coordinator", "admin", "physio"))):
-    player = await db.players.find_one({"id": data.player_id}, {"_id": 0})
+    player = await db.players.find_one(scoped(user, {"id": data.player_id}), {"_id": 0})
     if not player:
         raise HTTPException(status_code=404, detail="Jugador no encontrado")
     follow_up_data = InjuryFollowUpIn(
@@ -1548,6 +1548,7 @@ async def set_injury(data: InjuryIn, user=Depends(require_roles("coach", "coordi
     else:
         saved = {
             "id": str(uuid.uuid4()),
+            "club_id": require_club_context(user),
             "player_id": data.player_id,
             "status": data.status,
             "notes": data.notes,
@@ -1599,11 +1600,11 @@ async def list_injuries(team: Optional[str] = None, status: Optional[str] = None
 
 @api_router.post("/injuries/{injury_id}/follow-ups")
 async def add_injury_follow_up(injury_id: str, data: InjuryFollowUpIn, user=Depends(require_roles("admin", "coordinator", "physio"))):
-    injury = await db.injuries.find_one({"id": injury_id}, {"_id": 0})
+    injury = await db.injuries.find_one(scoped(user, {"id": injury_id}), {"_id": 0})
     if not injury:
         raise HTTPException(status_code=404, detail="Caso de lesion no encontrado")
     follow_up = _injury_follow_up_payload(data, user)
-    await db.injuries.update_one({"id": injury_id}, {"$set": {
+    await db.injuries.update_one(scoped(user, {"id": injury_id}), {"$set": {
         "status": data.status,
         "notes": data.notes,
         "diagnosis": data.diagnosis or injury.get("diagnosis", ""),
@@ -1620,7 +1621,7 @@ async def add_injury_follow_up(injury_id: str, data: InjuryFollowUpIn, user=Depe
 
 @api_router.post("/injuries/{injury_id}/close")
 async def close_injury_case(injury_id: str, user=Depends(require_roles("admin", "coordinator", "physio"))):
-    injury = await db.injuries.find_one({"id": injury_id}, {"_id": 0})
+    injury = await db.injuries.find_one(scoped(user, {"id": injury_id}), {"_id": 0})
     if not injury:
         raise HTTPException(status_code=404, detail="Caso de lesion no encontrado")
     follow_up = _injury_follow_up_payload(InjuryFollowUpIn(status="Disponible", notes="Alta medica"), user)
@@ -1641,7 +1642,7 @@ async def player_stats(team: Optional[str] = None, category: Optional[str] = Non
     - matches called up (convocatorias) / played / total minutes / avg
     - injuries history this season
     """
-    player_query = {}
+    player_query = {"club_id": require_club_context(user)}
     if team:
         player_query["team"] = team
     if category:
@@ -1662,9 +1663,9 @@ async def player_stats(team: Optional[str] = None, category: Optional[str] = Non
             if p.get("team") in coach_allowed or p.get("category") in coach_allowed
         ]
 
-    attendance_records = await db.attendance.find({}, {"_id": 0}).to_list(2000)
-    minutes_records = await db.minutes.find({}, {"_id": 0}).to_list(2000)
-    injury_records = await db.injuries.find({}, {"_id": 0}).to_list(2000)
+    attendance_records = await db.attendance.find(scoped(user), {"_id": 0}).to_list(2000)
+    minutes_records = await db.minutes.find(scoped(user), {"_id": 0}).to_list(2000)
+    injury_records = await db.injuries.find(scoped(user), {"_id": 0}).to_list(2000)
 
     # Init per-player buckets
     stats = {
@@ -1973,8 +1974,9 @@ async def add_rffm_team(data: RffmTeamIn, user=Depends(require_roles("admin", "c
     if data.scorers_url:
         _parse_rffm_url(data.scorers_url)
 
-    existing = await db.rffm_teams.find_one({"team_name": data.team_name})
+    existing = await db.rffm_teams.find_one(scoped(user, {"team_name": data.team_name}))
     doc = {
+        "club_id": require_club_context(user),
         "team_name": data.team_name,
         "calendar_url": data.calendar_url,
         "standings_url": standings_url,
@@ -2000,7 +2002,7 @@ async def add_rffm_team(data: RffmTeamIn, user=Depends(require_roles("admin", "c
 
 @api_router.get("/rffm/teams")
 async def list_rffm_teams(user=Depends(get_current_user)):
-    teams = await db.rffm_teams.find({}, {"_id": 0}).sort("team_name", 1).to_list(200)
+    teams = await db.rffm_teams.find(scoped(user), {"_id": 0}).sort("team_name", 1).to_list(200)
     latest = None
     for t in teams:
         ts = t.get("last_synced_at")
@@ -2011,6 +2013,9 @@ async def list_rffm_teams(user=Depends(get_current_user)):
 
 @api_router.delete("/rffm/teams/{team_id}")
 async def delete_rffm_team(team_id: str, user=Depends(require_roles("admin", "coordinator"))):
+    own = await db.rffm_teams.find_one(scoped(user, {"id": team_id}), {"_id": 0})
+    if not own:
+        raise HTTPException(status_code=404, detail="Equipo no encontrado")
     await db.rffm_teams.delete_one({"id": team_id})
     await db.rffm_matches.delete_many({"rffm_team_id": team_id})
     await db.rffm_scorers.delete_many({"rffm_team_id": team_id})
@@ -2031,7 +2036,7 @@ async def _do_sync(team: dict) -> dict:
     await db.rffm_matches.delete_many({"rffm_team_id": team_id})
     if matches:
         await db.rffm_matches.insert_many([{
-            **m, "id": str(uuid.uuid4()), "rffm_team_id": team_id,
+            **m, "id": str(uuid.uuid4()), "rffm_team_id": team_id, "club_id": team.get("club_id"),
             "team_name": team["team_name"],
             "venue": team.get("venue") if m["is_rayo_home"] else None,
             "synced_at": now_iso(),
@@ -2040,14 +2045,14 @@ async def _do_sync(team: dict) -> dict:
     await db.rffm_scorers.delete_many({"rffm_team_id": team_id})
     if scorers:
         await db.rffm_scorers.insert_many([{
-            **s, "id": str(uuid.uuid4()), "rffm_team_id": team_id,
+            **s, "id": str(uuid.uuid4()), "rffm_team_id": team_id, "club_id": team.get("club_id"),
             "parent_team_name": team["team_name"], "synced_at": now_iso(),
         } for s in scorers])
 
     await db.rffm_standings.delete_many({"rffm_team_id": team_id})
     if standings:
         await db.rffm_standings.insert_many([{
-            **st, "id": str(uuid.uuid4()), "rffm_team_id": team_id,
+            **st, "id": str(uuid.uuid4()), "rffm_team_id": team_id, "club_id": team.get("club_id"),
             "parent_team_name": team["team_name"], "synced_at": now_iso(),
         } for st in standings])
 
@@ -2062,7 +2067,7 @@ async def _do_sync(team: dict) -> dict:
 
 @api_router.post("/rffm/teams/{team_id}/sync")
 async def sync_rffm_team(team_id: str, user=Depends(require_roles("admin", "coordinator"))):
-    team = await db.rffm_teams.find_one({"id": team_id}, {"_id": 0})
+    team = await db.rffm_teams.find_one(scoped(user, {"id": team_id}), {"_id": 0})
     if not team:
         raise HTTPException(status_code=404, detail="Equipo RFFM no encontrado")
     return await _do_sync(team)
@@ -2070,7 +2075,7 @@ async def sync_rffm_team(team_id: str, user=Depends(require_roles("admin", "coor
 
 @api_router.post("/rffm/sync-all")
 async def sync_all_rffm(user=Depends(require_roles("admin", "coordinator"))):
-    teams = await db.rffm_teams.find({}, {"_id": 0}).to_list(200)
+    teams = await db.rffm_teams.find(scoped(user), {"_id": 0}).to_list(200)
     results = []
     for t in teams:
         try:
@@ -2083,7 +2088,7 @@ async def sync_all_rffm(user=Depends(require_roles("admin", "coordinator"))):
 
 @api_router.get("/rffm/matches")
 async def list_rffm_matches(team_id: Optional[str] = None, user=Depends(get_current_user)):
-    q = {}
+    q = scoped(user)
     if team_id:
         q["rffm_team_id"] = team_id
     return await db.rffm_matches.find(q, {"_id": 0}).sort([("team_name", 1), ("jornada", 1)]).to_list(2000)
@@ -2091,7 +2096,7 @@ async def list_rffm_matches(team_id: Optional[str] = None, user=Depends(get_curr
 
 @api_router.get("/rffm/scorers")
 async def list_rffm_scorers(team_id: Optional[str] = None, user=Depends(get_current_user)):
-    q = {}
+    q = scoped(user)
     if team_id:
         q["rffm_team_id"] = team_id
     return await db.rffm_scorers.find(q, {"_id": 0}).sort("goals", -1).to_list(500)
@@ -2099,7 +2104,7 @@ async def list_rffm_scorers(team_id: Optional[str] = None, user=Depends(get_curr
 
 @api_router.get("/rffm/standings")
 async def list_rffm_standings(team_id: Optional[str] = None, user=Depends(get_current_user)):
-    q = {}
+    q = scoped(user)
     if team_id:
         q["rffm_team_id"] = team_id
     return await db.rffm_standings.find(q, {"_id": 0}).sort([("parent_team_name", 1), ("position", 1)]).to_list(2000)
@@ -2112,7 +2117,8 @@ from routes import tickets as _tickets_routes  # noqa: E402
 from routes import branding as _branding_routes  # noqa: E402
 from routes import registration as _registration_routes  # noqa: E402
 from routes import clubs as _clubs_routes  # noqa: E402
-api_router.include_router(_chat_routes.router)
+# Chat interno retirado (Klink lo sustituirá): sin filtro de club, no se monta.
+# api_router.include_router(_chat_routes.router)
 api_router.include_router(_sheets_routes.router)
 api_router.include_router(_tickets_routes.router)
 api_router.include_router(_branding_routes.router)
@@ -2169,7 +2175,7 @@ async def confirm_inventory(item_id: str, data: InventoryConfirmIn, user=Depends
         "by_user_id": user["id"], "by_name": user.get("name", ""),
         "status": data.status, "notes": data.notes, "at": now_iso(),
     }
-    result = await db.inventory.update_one({"id": item_id}, {"$push": {"confirmations": entry}, "$set": {"status": data.status}})
+    result = await db.inventory.update_one(scoped(user, {"id": item_id}), {"$push": {"confirmations": entry}, "$set": {"status": data.status}})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Item no encontrado")
     return entry
@@ -2184,7 +2190,7 @@ async def list_player_kits(
     search: Optional[str] = None,
     user=Depends(get_current_user),
 ):
-    q = {}
+    q = scoped(user)
     if season:
         q["season"] = season
     if team:
@@ -2211,15 +2217,16 @@ async def list_player_kits(
 
 @api_router.put("/player-kits/{player_id}")
 async def upsert_player_kit(player_id: str, data: PlayerKitIn, user=Depends(require_roles("admin", "office"))):
-    player = await db.players.find_one({"id": player_id}, {"_id": 0})
+    player = await db.players.find_one(scoped(user, {"id": player_id}), {"_id": 0})
     if not player:
         raise HTTPException(status_code=404, detail="Jugador no encontrado")
-    existing = await db.player_kits.find_one({"player_id": player_id, "season": data.season}, {"_id": 0})
+    existing = await db.player_kits.find_one(scoped(user, {"player_id": player_id, "season": data.season}), {"_id": 0})
     items = [item.model_dump() for item in data.items]
     previous_items = (existing or {}).get("items") or []
-    await deduct_inventory_for_kit_delivery(previous_items, items)
+    await deduct_inventory_for_kit_delivery(previous_items, items, require_club_context(user))
     summary = summarize_kit_items(items)
     doc = {
+        "club_id": require_club_context(user),
         "player_id": player_id,
         "season": data.season,
         "items": items,
@@ -2274,21 +2281,17 @@ async def resolve_incident(incident_id: str, user=Depends(require_roles("admin")
 # ------------------ Dashboard stats ------------------
 @api_router.get("/dashboard/stats")
 async def dashboard_stats(user=Depends(get_current_user)):
-    query = {}
-    if user.get("club_id"):
-        query["club_id"] = user["club_id"]
+    query = scoped(user)
 
     # Consultas en paralelo (antes secuenciales → suma de latencias BD).
     players, incidents_open, tickets_pending, injury_cases, matches = await asyncio.gather(
         db.players.find(query, {"_id": 0}).to_list(5000),
-        db.incidents.count_documents({"status": "abierta"}),
-        db.tickets.count_documents({"status": "pendiente"}),
-        db.injuries.find({}, {"_id": 0, "status": 1, "closed_at": 1}).to_list(5000),
-        db.rffm_matches.find({}, {"_id": 0}).to_list(2000),
+        db.incidents.count_documents(scoped(user, {"status": "abierta"})),
+        db.tickets.count_documents(scoped(user, {"status": "pendiente"})),
+        db.injuries.find(scoped(user), {"_id": 0, "status": 1, "closed_at": 1}).to_list(5000),
+        db.rffm_matches.find(scoped(user), {"_id": 0}).to_list(2000),
     )
 
-    if user.get("club_id"):
-        players = [p for p in players if p.get("club_id") == user["club_id"]]
     total = len(players)
     morosos = sum(1 for p in players if not p.get("payment_status"))
     attention_count = sum(1 for p in players if player_has_attention(p))

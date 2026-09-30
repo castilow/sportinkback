@@ -38,7 +38,8 @@ async def _sync_captacion_destacados(match_doc: dict, user: dict) -> None:
         if not pid:
             continue
         dup = await db.captacion_entries.find_one(
-            {"kind": "destacado_partido", "match_sheet_id": sheet_id, "player_id": pid},
+            {"kind": "destacado_partido", "match_sheet_id": sheet_id, "player_id": pid,
+             "club_id": match_doc.get("club_id")},
             {"_id": 0},
         )
         if dup:
@@ -186,8 +187,9 @@ async def list_training_sheets(team: Optional[str] = None, user=Depends(get_curr
 
 @router.get("/training-sheets/{sheet_id}/photo")
 async def training_photo(sheet_id: str, request: Request):
-    await get_current_user(request)
-    sheet = await db.training_sheets.find_one({"id": sheet_id}, {"_id": 0})
+    user = await get_current_user(request)
+    sheet = await db.training_sheets.find_one(
+        {"id": sheet_id, "club_id": require_club_context(user)}, {"_id": 0})
     if not sheet or not sheet.get("photo_path"):
         raise HTTPException(status_code=404, detail="Foto no encontrada")
     data, ct = get_object(sheet["photo_path"])
@@ -291,7 +293,8 @@ async def list_match_sheets(team: Optional[str] = None, user=Depends(get_current
 
 @router.get("/match-sheets/{sheet_id}/pdf")
 async def match_sheet_pdf(sheet_id: str, user=Depends(get_current_user)):
-    sheet = await db.match_sheets.find_one({"id": sheet_id}, {"_id": 0})
+    sheet = await db.match_sheets.find_one(
+        {"id": sheet_id, "club_id": require_club_context(user)}, {"_id": 0})
     if not sheet:
         raise HTTPException(status_code=404, detail="Hoja no encontrada")
     if user.get("role") == "coach" and sheet.get("coach_id") != user["id"]:
@@ -313,7 +316,7 @@ def _build_match_sheet_pdf(sheet: dict) -> bytes:
     big = ParagraphStyle("B", parent=styles["Normal"], fontSize=14, alignment=1, textColor=colors.HexColor("#ED1C24"), spaceBefore=4, spaceAfter=6)
 
     story = [
-        Paragraph("C.F. Rayo Majadahonda — Hoja de partido", h1),
+        Paragraph("Hoja de partido", h1),
         Paragraph(f"{sheet.get('competition') or 'Liga'} · Jornada {sheet.get('jornada') or '-'} · Grupo {sheet.get('group') or '-'}", meta),
         Spacer(1, 0.2*cm),
         Paragraph(f"<b>{sheet.get('team', '')}</b> &nbsp;·&nbsp; vs &nbsp;·&nbsp; <b>{sheet.get('opponent', '')}</b>", h2),
@@ -386,7 +389,7 @@ def _build_match_sheet_pdf(sheet: dict) -> bytes:
     story.append(sign)
 
     story.append(Spacer(1, 0.8*cm))
-    story.append(Paragraph(f"Documento generado por Rayo Majadahonda Digital · {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M UTC')}", meta))
+    story.append(Paragraph(f"Documento generado con Sportink · {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M UTC')}", meta))
 
     doc.build(story)
     return buf.getvalue()
@@ -400,7 +403,7 @@ async def list_captacion(
     user=Depends(get_current_user),
 ):
     """Lista candidatos de captación: destacados en hojas de partido y visitas manuales."""
-    q: dict = {}
+    q: dict = {"club_id": require_club_context(user)}
     if team:
         q["team"] = team
     if kind in ("destacado_partido", "visita"):
@@ -421,6 +424,7 @@ async def create_captacion_visita(data: CaptacionVisitaIn, user=Depends(require_
             raise HTTPException(status_code=403, detail="No puedes registrar visitas para un equipo que no tienes asignado")
     entry = {
         "id": str(uuid.uuid4()),
+        "club_id": require_club_context(user),
         "kind": "visita",
         "player_id": None,
         "player_name": data.player_name.strip(),
@@ -446,6 +450,10 @@ async def create_captacion_visita(data: CaptacionVisitaIn, user=Depends(require_
 
 @router.delete("/captacion/{entry_id}")
 async def delete_captacion_entry(entry_id: str, user=Depends(require_roles("admin", "coordinator"))):
+    own = await db.captacion_entries.find_one(
+        {"id": entry_id, "club_id": require_club_context(user)}, {"_id": 0, "id": 1})
+    if not own:
+        raise HTTPException(status_code=404, detail="Entrada no encontrada")
     r = await db.captacion_entries.delete_one({"id": entry_id})
     if r.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Entrada no encontrada")
@@ -521,7 +529,7 @@ async def create_convocation(data: ConvocationIn, user=Depends(require_roles("co
     # publicarlo en la sala se devuelve para que el entrenador lo copie.
     called_ids = {r["player_id"] for r in data.records if r.get("called")}
     called_players = await db.players.find(
-        {"id": {"$in": list(called_ids)}}, {"_id": 0, "id": 1, "name": 1}
+        {"id": {"$in": list(called_ids)}, "club_id": require_club_context(user)}, {"_id": 0, "id": 1, "name": 1}
     ).to_list(200) if called_ids else []
     names = sorted([p["name"] for p in called_players])
     whatsapp_text = build_convocation_text(data, names)

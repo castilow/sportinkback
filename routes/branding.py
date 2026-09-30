@@ -22,10 +22,20 @@ from pydantic import BaseModel, Field
 
 from deps import (
     db, now_iso, uuid, APP_NAME, MAX_UPLOAD_BYTES,
-    require_roles, put_object,
+    require_roles, put_object, _fetch_default_club_id,
 )
 
 router = APIRouter()
+
+
+async def require_brand_admin(user=Depends(require_roles("admin"))):
+    """La marca es global (la pantalla de login la lee sin sesión): solo el admin del
+    club principal puede modificarla. Un club nuevo creado por registro NO puede
+    tocar la marca de los demás."""
+    default_club = await _fetch_default_club_id()
+    if not default_club or user.get("club_id") != default_club:
+        raise HTTPException(status_code=403, detail="Solo el club principal puede editar la marca")
+    return user
 
 # Clave legacy: antes de existir presets, había un único documento "default".
 # Se conserva solo para poder migrarlo automáticamente al nuevo modelo.
@@ -167,17 +177,17 @@ async def _save_active(payload: BrandingIn, user: dict) -> dict:
 
 
 @router.put("/branding")
-async def put_branding(payload: BrandingIn, user=Depends(require_roles("admin"))):
+async def put_branding(payload: BrandingIn, user=Depends(require_brand_admin)):
     return await _save_active(payload, user)
 
 
 @router.post("/branding")
-async def post_branding(payload: BrandingIn, user=Depends(require_roles("admin"))):
+async def post_branding(payload: BrandingIn, user=Depends(require_brand_admin)):
     return await _save_active(payload, user)
 
 
 @router.post("/branding/logo")
-async def upload_logo(file: UploadFile = File(...), user=Depends(require_roles("admin"))):
+async def upload_logo(file: UploadFile = File(...), user=Depends(require_brand_admin)):
     """Sube un logo a Storage y devuelve su ruta. Alternativa a incrustarlo en base64."""
     ext = (file.filename or "logo.png").split(".")[-1].lower()
     if ext not in ("png", "jpg", "jpeg", "webp", "svg"):
@@ -197,14 +207,14 @@ async def upload_logo(file: UploadFile = File(...), user=Depends(require_roles("
 # ------------------------------------------------------------------
 
 @router.get("/branding/presets")
-async def list_presets(user=Depends(require_roles("admin"))):
+async def list_presets(user=Depends(require_brand_admin)):
     presets = await _list_presets_raw()
     presets.sort(key=lambda p: p.get("updated_at") or "", reverse=True)
     return [_clean_preset(p) for p in presets]
 
 
 @router.post("/branding/presets")
-async def create_preset(payload: PresetIn, user=Depends(require_roles("admin"))):
+async def create_preset(payload: PresetIn, user=Depends(require_brand_admin)):
     data = {
         "id": str(uuid.uuid4()),
         "name": payload.name.strip() or "Sin nombre",
@@ -221,7 +231,7 @@ async def create_preset(payload: PresetIn, user=Depends(require_roles("admin")))
 
 
 @router.put("/branding/presets/{preset_id}")
-async def update_preset(preset_id: str, payload: PresetUpdate, user=Depends(require_roles("admin"))):
+async def update_preset(preset_id: str, payload: PresetUpdate, user=Depends(require_brand_admin)):
     existing = await db.branding.find_one({"id": preset_id}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Preset no encontrado")
@@ -242,7 +252,7 @@ async def update_preset(preset_id: str, payload: PresetUpdate, user=Depends(requ
 
 
 @router.delete("/branding/presets/{preset_id}")
-async def delete_preset(preset_id: str, user=Depends(require_roles("admin"))):
+async def delete_preset(preset_id: str, user=Depends(require_brand_admin)):
     presets = await _list_presets_raw()
     target = next((p for p in presets if p.get("id") == preset_id), None)
     if not target:
@@ -256,7 +266,7 @@ async def delete_preset(preset_id: str, user=Depends(require_roles("admin"))):
 
 
 @router.post("/branding/presets/{preset_id}/activate")
-async def activate_preset(preset_id: str, user=Depends(require_roles("admin"))):
+async def activate_preset(preset_id: str, user=Depends(require_brand_admin)):
     presets = await _list_presets_raw()
     target = next((p for p in presets if p.get("id") == preset_id), None)
     if not target:
