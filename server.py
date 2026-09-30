@@ -829,7 +829,7 @@ async def players_categories(user=Depends(get_current_user)):
     cats = set()
     try:
         rows = await db.fetch_json_rows(
-            f"select distinct categoria from public.teams where club_id = {_sql_literal(club_id)}::uuid and activo = true and categoria is not null;"
+            f"select json_build_object('categoria', categoria)::text from (select distinct categoria from public.teams where club_id = {_sql_literal(club_id)}::uuid and activo = true and categoria is not null) t;"
         )
         cats.update(r["categoria"] for r in rows if r.get("categoria"))
     except Exception:
@@ -1138,7 +1138,7 @@ async def _club_sport_id(club_id: str) -> Optional[str]:
     from postgres_compat import _sql_literal
     rows = await db.fetch_json_rows(
         f"""
-        select s.id::text as id
+        select json_build_object('id', s.id::text)::text
         from public.club_sports cs join public.sports s on s.id = cs.sport_id
         where cs.club_id = {_sql_literal(club_id)}::uuid
         order by s.nombre limit 1;
@@ -1146,7 +1146,7 @@ async def _club_sport_id(club_id: str) -> Optional[str]:
     )
     if rows:
         return rows[0]["id"]
-    rows = await db.fetch_json_rows("select id::text as id from public.sports order by (slug='futbol') desc, nombre limit 1;")
+    rows = await db.fetch_json_rows("select json_build_object('id', id::text)::text from public.sports order by (slug='futbol') desc, nombre limit 1;")
     return rows[0]["id"] if rows else None
 
 
