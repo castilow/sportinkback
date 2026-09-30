@@ -391,20 +391,59 @@ def invalidate_user_cache(access_token: Optional[str] = None) -> None:
         _USER_CACHE.clear()
 
 
+_JWKS_CLIENT = None
+
+
+def _jwks_client():
+    """Cliente JWKS de Supabase (claves públicas, sin secreto). Cachea las claves 1 h."""
+    global _JWKS_CLIENT
+    if _JWKS_CLIENT is None:
+        base = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
+        if not base:
+            return None
+        import jwt as pyjwt
+        _JWKS_CLIENT = pyjwt.PyJWKClient(
+            f"{base}/auth/v1/.well-known/jwks.json",
+            cache_keys=True,
+            lifespan=3600,
+            timeout=5,
+        )
+    return _JWKS_CLIENT
+
+
 def _try_local_jwt_auth_user(access_token: str) -> Optional[dict]:
-    """Valida el JWT en local si hay SUPABASE_JWT_SECRET (ms vs segundos)."""
-    secret = (os.environ.get("SUPABASE_JWT_SECRET") or "").strip()
-    if not secret:
-        return None
+    """Valida el JWT en local (ms en vez de 7-12 s llamando a Supabase).
+
+    - Claves de firma nuevas (ES256/RS256): se verifica con la clave PÚBLICA del JWKS
+      de Supabase, no hace falta ningún secreto.
+    - Clave legacy (HS256): solo si hay SUPABASE_JWT_SECRET.
+    Si algo falla devuelve None y se cae a la validación remota, que sigue siendo válida.
+    """
     try:
         import jwt as pyjwt
-        claims = pyjwt.decode(
-            access_token,
-            secret,
-            algorithms=["HS256"],
-            audience="authenticated",
-            options={"require": ["exp", "sub"]},
-        )
+
+        alg = (pyjwt.get_unverified_header(access_token).get("alg") or "").upper()
+        base = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
+        common = {
+            "audience": "authenticated",
+            "options": {"require": ["exp", "sub"]},
+        }
+        if base:
+            common["issuer"] = f"{base}/auth/v1"
+
+        if alg in ("ES256", "RS256"):
+            client = _jwks_client()
+            if client is None:
+                return None
+            key = client.get_signing_key_from_jwt(access_token).key
+            claims = pyjwt.decode(access_token, key, algorithms=[alg], **common)
+        elif alg == "HS256":
+            secret = (os.environ.get("SUPABASE_JWT_SECRET") or "").strip()
+            if not secret:
+                return None
+            claims = pyjwt.decode(access_token, secret, algorithms=["HS256"], **common)
+        else:
+            return None
         return {
             "id": claims.get("sub"),
             "email": claims.get("email") or (claims.get("user_metadata") or {}).get("email"),
@@ -477,7 +516,7 @@ async def resolve_app_user_from_token(access_token: str) -> dict:
         return cached
 
     # JWT local (ms) si hay SUPABASE_JWT_SECRET; si no, GET remoto (~7–12s) en thread
-    auth_user = _try_local_jwt_auth_user(access_token)
+    auth_user = await asyncio.to_thread(_try_local_jwt_auth_user, access_token)
     if auth_user is None:
         auth_user = await asyncio.to_thread(get_supabase_user, access_token)
 

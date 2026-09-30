@@ -28,6 +28,7 @@ from deps import (
     resend_supabase_signup,
     supabase_rpc,
     supabase_admin_find_user_by_email,
+    invalidate_user_cache,
     uuid,
 )
 
@@ -422,7 +423,9 @@ async def complete_public_registration(
         logger.error("finalize_public_registration falló: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc))
 
-    # Refrescar identidad
+    # Refrescar identidad: el usuario "pending" quedó en caché por token; sin invalidarlo,
+    # /auth/me seguiría devolviendo role=pending y el front volvería a /onboarding.
+    invalidate_user_cache()
     refreshed = await get_current_user(request)
     return {
         **(result if isinstance(result, dict) else {"result": result}),

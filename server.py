@@ -14,6 +14,7 @@ import requests  # used only by RFFM scraping (kept local to this module)
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, UploadFile, File, Form, Query, Header
 from fastapi.responses import StreamingResponse, Response as FastAPIResponse
 from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field, EmailStr
 # pandas/reportlab se importan lazy en export Excel/PDF para cold start más rápido
 
@@ -27,6 +28,7 @@ from deps import (
     get_current_user, require_roles, require_club_context,
     resolve_app_user_from_token,
     ensure_supabase_staff_user, delete_supabase_auth_user, sign_up_with_supabase,
+    supabase_admin_find_user_by_email,
 )
 
 CATEGORIES = ["Prebenjamín", "Benjamín", "Alevín", "Infantil", "Cadete", "Juvenil", "Senior/Filial", "Femenino"]
@@ -698,6 +700,15 @@ async def create_user(data: UserCreate, user=Depends(require_roles("admin", "coo
     existing = await db.users.find_one({"email": email})
     if existing:
         raise HTTPException(status_code=400, detail="El email ya existe")
+    # Un correo que ya tiene cuenta en Sportink (de este u otro club) no se reutiliza:
+    # ensure_supabase_staff_user reescribiría sus metadatos de rol.
+    try:
+        if supabase_admin_find_user_by_email(email):
+            raise HTTPException(status_code=409, detail="Ya existe una cuenta con ese correo. Usa otro correo.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("No se pudo comprobar el correo en Auth: %s", exc)
     new_id = str(uuid.uuid4())
     auth_user = ensure_supabase_staff_user(
         email,
@@ -2784,6 +2795,10 @@ if _cors_raw and _cors_raw != '*':
 # permitía leer y escribir la API en nombre de un usuario con sesión abierta.
 _vercel_project = os.environ.get("VERCEL_PROJECT_SLUG", "sportinksoft").strip()
 _allow_origin_regex = rf"^https://{_vercel_project}(-[a-z0-9-]+)?\.vercel\.app$"
+
+# Comprime las respuestas JSON grandes (p. ej. /players): 5-10x menos tráfico.
+# Se añade ANTES que CORS para que CORS quede como capa exterior.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 app.add_middleware(
     CORSMiddleware,
