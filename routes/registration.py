@@ -261,6 +261,21 @@ async def register_public(data: PublicRegistrationIn, request: Request):
     payload = _build_payload(data)
 
     existing_pending = await _find_pending_by_email(email)
+    if existing_pending and not existing_pending.get("auth_user_id") and hasattr(db, "execute"):
+        # Un pendiente sin usuario en Auth (alta interrumpida o registro fallido) no debe
+        # bloquear el correo para siempre: si Auth no conoce el email, se descarta y se reintenta.
+        try:
+            auth_known = supabase_admin_find_user_by_email(email)
+        except Exception as exc:
+            logger.warning("No se pudo comprobar Auth para pendiente huérfano: %s", exc)
+            auth_known = True  # ante la duda, no borrar
+        if not auth_known:
+            from postgres_compat import _sql_literal
+            await db.execute(
+                "delete from public.public_registrations "
+                f"where id = {_sql_literal(existing_pending['id'])}::uuid and status = 'pending';"
+            )
+            existing_pending = None
     if existing_pending:
         return {
             "status": "pending_verification",
@@ -287,7 +302,9 @@ async def register_public(data: PublicRegistrationIn, request: Request):
         logger.error("Signup falló: %s", exc)
         raise HTTPException(status_code=400, detail="No se pudo crear la cuenta")
 
-    auth_user = signup.get("user") or {}
+    # Con confirmación de correo activada, /auth/v1/signup devuelve el usuario en la raíz
+    # (no dentro de "user"); con confirmación desactivada lo devuelve dentro de "user".
+    auth_user = signup.get("user") or (signup if signup.get("id") else {})
     auth_user_id = auth_user.get("id")
     try:
         reg_id = await _insert_pending_registration(
