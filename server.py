@@ -822,6 +822,23 @@ async def _resolve_team_name(club_id: str, team_id: Optional[str], team_name: st
     return None, team_name
 
 
+@api_router.get("/players/categories")
+async def players_categories(user=Depends(get_current_user)):
+    club_id = require_club_context(user)
+    from postgres_compat import _sql_literal
+    cats = set()
+    try:
+        rows = await db.fetch_json_rows(
+            f"select distinct categoria from public.teams where club_id = {_sql_literal(club_id)}::uuid and activo = true and categoria is not null;"
+        )
+        cats.update(r["categoria"] for r in rows if r.get("categoria"))
+    except Exception:
+        pass
+    pl = await db.players.find({"club_id": club_id}, {"_id": 0, "category": 1}).to_list(5000)
+    cats.update(p.get("category") for p in pl if p.get("category"))
+    return {"categories": sorted(cats)}
+
+
 @api_router.get("/players")
 async def list_players(
     category: Optional[str] = None,
@@ -1056,15 +1073,15 @@ async def register_player_office(data: PlayerRegistrationIn, user=Depends(requir
 
 # ------------------ Import Excel/CSV ------------------
 COLUMN_ALIASES = {
-    "name": ["nombre", "nombre del jugador", "jugador", "name", "player"],
-    "dni": ["dni", "nif", "documento"],
-    "birthdate": ["fecha de nacimiento", "nacimiento", "birthdate", "fecha_nacimiento", "fecha nacimiento"],
-    "category": ["categoría", "categoria", "category"],
-    "team": ["equipo", "team"],
+    "name": ["nombre", "nombre del jugador", "jugador", "name", "player", "nom", "nom del jugador", "jugador/a", "full name", "player name"],
+    "dni": ["dni", "nif", "documento", "document", "id", "nie"],
+    "birthdate": ["fecha de nacimiento", "nacimiento", "birthdate", "fecha_nacimiento", "fecha nacimiento", "data de naixement", "naixement", "date of birth", "birth date", "dob"],
+    "category": ["categoría", "categoria", "category", "cat", "categoria/edat"],
+    "team": ["equipo", "team", "equip"],
     "entity": ["entidad", "entity", "club", "fundacion", "fundación"],
-    "payment_status": ["estado de pago", "estado pago", "pago", "payment"],
-    "insurance_expiry": ["fecha de vencimiento de seguro", "vencimiento seguro", "seguro", "insurance", "seguro_vence"],
-    "dni_expiry": ["vencimiento dni", "dni vencimiento", "caducidad dni"],
+    "payment_status": ["estado de pago", "estado pago", "pago", "payment", "pagament", "estat de pagament", "paid"],
+    "insurance_expiry": ["fecha de vencimiento de seguro", "vencimiento seguro", "seguro", "insurance", "seguro_vence", "assegurança", "asseguranca", "venciment assegurança", "insurance expiry"],
+    "dni_expiry": ["vencimiento dni", "dni vencimiento", "caducidad dni", "venciment dni", "dni expiry"],
 }
 
 
@@ -1112,6 +1129,99 @@ def map_columns(columns) -> dict:
     return mapping
 
 
+def _clean_cell(val) -> str:
+    s = "" if val is None else str(val).strip()
+    return "" if s.lower() in ("nan", "none", "nat") else s
+
+
+async def _club_sport_id(club_id: str) -> Optional[str]:
+    from postgres_compat import _sql_literal
+    rows = await db.fetch_json_rows(
+        f"""
+        select s.id::text as id
+        from public.club_sports cs join public.sports s on s.id = cs.sport_id
+        where cs.club_id = {_sql_literal(club_id)}::uuid
+        order by s.nombre limit 1;
+        """
+    )
+    if rows:
+        return rows[0]["id"]
+    rows = await db.fetch_json_rows("select id::text as id from public.sports order by (slug='futbol') desc, nombre limit 1;")
+    return rows[0]["id"] if rows else None
+
+
+async def _existing_team_map(club_id: str) -> dict:
+    from postgres_compat import _sql_literal
+    rows = await db.fetch_json_rows(
+        f"""
+        select id::text as id, nombre from public.teams
+        where club_id = {_sql_literal(club_id)}::uuid and activo = true;
+        """
+    )
+    return {r["nombre"].strip().lower(): r for r in rows}
+
+
+async def _ensure_team(club_id: str, sport_id: Optional[str], name: str, category: str) -> tuple:
+    """Devuelve (team_id, team_name), creando el equipo si no existe."""
+    from postgres_compat import _sql_literal
+    rows = await db.fetch_json_rows(
+        f"""
+        select id::text as id, nombre from public.teams
+        where club_id = {_sql_literal(club_id)}::uuid and lower(nombre) = lower({_sql_literal(name)})
+        order by activo desc limit 1;
+        """
+    )
+    if rows:
+        return rows[0]["id"], rows[0]["nombre"]
+    if not sport_id:
+        return None, name
+    rows = await db.fetch_json_rows(
+        f"""
+        insert into public.teams (club_id, sport_id, nombre, categoria, genero, temporada, entidad, activo)
+        values ({_sql_literal(club_id)}::uuid, {_sql_literal(sport_id)}::uuid, {_sql_literal(name)},
+                {_sql_literal(category)}, 'MIXTO', '25-26', 'club', true)
+        on conflict (club_id, sport_id, nombre, temporada) do update set activo = true
+        returning id::text as id, nombre;
+        """
+    )
+    if rows:
+        return rows[0]["id"], rows[0]["nombre"]
+    return None, name
+
+
+@api_router.get("/players/import/template.xlsx")
+async def import_template(user=Depends(require_roles("admin", "coordinator"))):
+    import pandas as pd
+    df = pd.DataFrame([
+        {"Nombre del Jugador": "Pablo García", "DNI": "12345678X", "Fecha de Nacimiento": "2014-05-12",
+         "Categoría": "Alevín", "Equipo": "Alevín A", "Estado de Pago (Sí/No)": "Sí",
+         "Fecha de Vencimiento de Seguro": "2027-08-26", "Vencimiento DNI": "2030-07-06"},
+        {"Nombre del Jugador": "Lucía Romero", "DNI": "", "Fecha de Nacimiento": "2010-03-22",
+         "Categoría": "Cadete", "Equipo": "Cadete Femenino", "Estado de Pago (Sí/No)": "No",
+         "Fecha de Vencimiento de Seguro": "", "Vencimiento DNI": ""},
+    ])
+    notes = pd.DataFrame({"Instrucciones": [
+        "Obligatorias: Nombre del Jugador y Categoría. El resto es opcional.",
+        "Categoría y Equipo son texto libre: usa los nombres de TU club (Sub-12, Benjamín, Senior, Mini...).",
+        "Si el Equipo no existe todavía se crea automáticamente. Si lo dejas vacío, se usa la categoría como equipo.",
+        "Fechas: AAAA-MM-DD o DD/MM/AAAA. Estado de pago: Sí / No.",
+        "Borra las dos filas de ejemplo antes de subir tu listado.",
+    ]})
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="Jugadores")
+        notes.to_excel(w, index=False, sheet_name="Instrucciones")
+        for ws in w.book.worksheets:
+            for col in ws.columns:
+                ws.column_dimensions[col[0].column_letter].width = max(14, min(60, max(len(str(c.value or "")) for c in col) + 2))
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="plantilla_jugadores.xlsx"'},
+    )
+
+
 @api_router.post("/players/import/preview")
 async def import_preview(file: UploadFile = File(...), user=Depends(require_roles("admin"))):
     import pandas as pd
@@ -1142,20 +1252,24 @@ async def import_preview(file: UploadFile = File(...), user=Depends(require_role
                 errors.append({"row": int(idx) + 2, "error": "Nombre vacío"})
                 continue
             cat = str(row[mapping["category"]]).strip() if mapping.get("category") else ""
-            if cat not in CATEGORIES:
-                errors.append({"row": int(idx) + 2, "error": f"Categoría inválida: {cat}"})
+            if not cat or cat.lower() == "nan":
+                errors.append({"row": int(idx) + 2, "error": "Categoría vacía"})
+                continue
+            cat = cat[:80]
             p = {
                 "name": name_val,
-                "dni": str(row[mapping["dni"]]).strip() if mapping.get("dni") else "",
+                "dni": _clean_cell(row[mapping["dni"]]) if mapping.get("dni") else "",
                 "birthdate": parse_date_val(row[mapping["birthdate"]]) if mapping.get("birthdate") else None,
                 "category": cat,
-                "team": str(row[mapping["team"]]).strip() if mapping.get("team") else "",
+                "team": _clean_cell(row[mapping["team"]]) if mapping.get("team") else "",
                 "entity": parse_entity(row[mapping["entity"]]) if mapping.get("entity") else "club",
                 "payment_status": parse_payment(row[mapping["payment_status"]]) if mapping.get("payment_status") else True,
                 "insurance_expiry": parse_date_val(row[mapping["insurance_expiry"]]) if mapping.get("insurance_expiry") else None,
                 "dni_expiry": parse_date_val(row[mapping["dni_expiry"]]) if mapping.get("dni_expiry") else None,
                 "phone": "", "email": "", "notes": "",
             }
+            if not p["team"]:
+                p["team"] = cat
             if not p["payment_status"]:
                 payment_due += 1
             if p["insurance_expiry"]:
@@ -1167,6 +1281,14 @@ async def import_preview(file: UploadFile = File(...), user=Depends(require_role
             rows.append(p)
         except Exception as e:
             errors.append({"row": int(idx) + 2, "error": str(e)})
+
+    club_id_pv = require_club_context(user)
+    try:
+        existing_teams = await _existing_team_map(club_id_pv)
+    except Exception:
+        existing_teams = {}
+    new_teams = sorted({r["team"] for r in rows if r["team"].strip().lower() not in existing_teams})
+    categories = sorted({r["category"] for r in rows})
 
     batch_id = str(uuid.uuid4())
     await db.import_batches.insert_one({
@@ -1180,6 +1302,8 @@ async def import_preview(file: UploadFile = File(...), user=Depends(require_role
         "insurance_expired": insurance_expired,
         "payment_due": payment_due,
         "sample": rows[:8],
+        "categories": categories,
+        "new_teams": new_teams,
         "mapping": {k: str(v) for k, v in mapping.items()},
     }
 
@@ -1195,7 +1319,19 @@ async def import_commit(batch_id: str, user=Depends(require_roles("admin"))):
     if batch.get("club_id") and batch.get("club_id") != club_id:
         raise HTTPException(status_code=403, detail="Ese lote pertenece a otro club")
     to_insert = []
+    sport_id = await _club_sport_id(club_id)
+    team_cache: dict = {}
+    created_teams = 0
+    known_before = set((await _existing_team_map(club_id)).keys())
     for r in batch["rows"]:
+        tname = (r.get("team") or r.get("category") or "").strip()
+        key = tname.lower()
+        if tname and key not in team_cache:
+            team_cache[key] = await _ensure_team(club_id, sport_id, tname, r.get("category") or tname)
+            if key not in known_before:
+                created_teams += 1
+        if tname:
+            r["team_id"], r["team"] = team_cache[key]
         r["id"] = str(uuid.uuid4())
         r["club_id"] = club_id
         r["created_at"] = now_iso()
@@ -1203,7 +1339,7 @@ async def import_commit(batch_id: str, user=Depends(require_roles("admin"))):
     if to_insert:
         await db.players.insert_many(to_insert)
     await db.import_batches.update_one({"id": batch_id}, {"$set": {"committed": True}})
-    return {"imported": len(to_insert)}
+    return {"imported": len(to_insert), "teams_created": created_teams}
 
 
 # ------------------ Export Excel ------------------

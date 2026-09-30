@@ -299,6 +299,23 @@ def resend_supabase_signup(email: str) -> None:
         raise HTTPException(status_code=400, detail=_supabase_error_message(resp))
 
 
+def request_password_recovery(email: str, redirect_to: Optional[str] = None) -> None:
+    """Pide a Supabase el correo de recuperación (el enlace redirige a redirect_to con el token en el hash)."""
+    path = "/auth/v1/recover"
+    if redirect_to:
+        from urllib.parse import quote
+
+        path += f"?redirect_to={quote(redirect_to, safe='')}"
+    resp = _supabase_public_request(
+        "POST",
+        path,
+        json={"email": email.lower()},
+        headers={"Content-Type": "application/json"},
+    )
+    if resp.status_code >= 300:
+        logger.warning("Supabase recover %s: %s", resp.status_code, resp.text[:200])
+
+
 def supabase_rpc(fn_name: str, payload: dict) -> dict:
     """Ejecuta una RPC de Postgres vía PostgREST con service_role."""
     resp = _supabase_admin_request(

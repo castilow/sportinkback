@@ -243,17 +243,33 @@ class PostgresCollection:
         self._db = db
         self._name = name
 
-    async def _all_rows(self) -> list[dict]:
+    # Claves cuya igualdad exacta con un texto se puede resolver en SQL con índice.
+    # Es solo un PRE-filtro (superconjunto): después se aplica _matches() en Python,
+    # así que la semántica no cambia; solo evitamos traer TODA la colección
+    # (de todos los clubes) para quedarnos con las filas de uno.
+    _SQL_PREFILTER_KEYS = ("club_id", "id")
+
+    @classmethod
+    def _sql_prefilter(cls, query: Optional[dict]) -> str:
+        parts = []
+        for key in cls._SQL_PREFILTER_KEYS:
+            expected = (query or {}).get(key)
+            if isinstance(expected, str) and expected:
+                parts.append(f"doc->>{_sql_literal(key)} = {_sql_literal(expected)}")
+        return (" and " + " and ".join(parts)) if parts else ""
+
+    async def _all_rows(self, query: Optional[dict] = None) -> list[dict]:
         sql = (
             "select json_build_object('row_id', row_id, 'doc', doc)::text "
             "from public.app_documents "
-            f"where collection = {_sql_literal(self._name)} "
+            f"where collection = {_sql_literal(self._name)}"
+            f"{self._sql_prefilter(query)} "
             "order by row_id"
         )
         return await self._db.fetch_json_rows(sql)
 
     async def _find_rows(self, query: Optional[dict]) -> list[dict]:
-        rows = await self._all_rows()
+        rows = await self._all_rows(query)
         return [row for row in rows if _matches(row["doc"], query)]
 
     async def _find_docs(self, query: Optional[dict], projection: Optional[dict]) -> list[dict]:

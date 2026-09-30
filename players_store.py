@@ -186,8 +186,15 @@ async def _fetch_sql_rows(db: Any, sql: str) -> list[dict]:
     return data if isinstance(data, list) else []
 
 
-async def fetch_all_sql_players(db: Any) -> list[dict]:
+async def fetch_all_sql_players(db: Any, club_id: Optional[str] = None) -> list[dict]:
     sql = PLAYERS_SELECT_SQL.format(temporada=_sql_literal(TEMPORADA))
+    if club_id:
+        import uuid as _uuid
+        try:
+            club_id = str(_uuid.UUID(str(club_id)))
+        except ValueError:
+            return []  # club_id no válido: nunca devolvemos jugadores de otros clubes
+        sql += f" and p.club_id = {_sql_literal(club_id)}::uuid"
     rows = await _fetch_sql_rows(db, sql)
     return sorted(
         [sql_row_to_player(row) for row in rows if row.get("id")],
@@ -385,15 +392,21 @@ class PlayersStore:
     def __init__(self, db: Any, fallback_collection: Any):
         self._db = db
         self._fallback = fallback_collection
-        self._cache: Optional[list[dict]] = None
+        # Caché por club: None = todos los clubes (consultas sin club_id).
+        # Así el club A no recarga sus jugadores cuando el club B escribe.
+        self._cache: dict[Optional[str], list[dict]] = {}
 
-    async def _load(self) -> list[dict]:
-        if self._cache is None:
-            self._cache = await fetch_all_sql_players(self._db)
-        return self._cache
+    async def _load(self, club_id: Optional[str] = None) -> list[dict]:
+        if club_id not in self._cache:
+            self._cache[club_id] = await fetch_all_sql_players(self._db, club_id)
+        return self._cache[club_id]
 
-    def _invalidate(self):
-        self._cache = None
+    def _invalidate(self, club_id: Optional[str] = None):
+        if club_id:
+            self._cache.pop(club_id, None)
+            self._cache.pop(None, None)
+        else:
+            self._cache.clear()
 
     async def _enabled(self) -> bool:
         return await relational_players_enabled(self._db)
@@ -416,8 +429,9 @@ class PlayersStore:
     async def insert_one(self, doc: dict):
         if not await self._enabled():
             return await self._fallback.insert_one(doc)
-        self._invalidate()
+        self._invalidate(doc.get("club_id"))
         created = await insert_sql_player(self._db, doc)
+        self._invalidate(doc.get("club_id"))
         return InsertOneResult(inserted_id=created.get("id"))
 
     async def insert_many(self, docs: list[dict]):
@@ -425,7 +439,8 @@ class PlayersStore:
             return await self._fallback.insert_many(docs)
         for doc in docs:
             await insert_sql_player(self._db, doc)
-        self._invalidate()
+        for cid in {d.get("club_id") for d in docs} or {None}:
+            self._invalidate(cid)
         return None
 
     async def update_one(self, query: dict, update: dict, upsert: bool = False):
@@ -440,7 +455,9 @@ class PlayersStore:
             return UpdateResult(0, 0)
         merged = {**existing, **patch}
         await update_sql_player(self._db, player_id, merged)
-        self._invalidate()
+        self._invalidate(existing.get("club_id"))
+        if merged.get("club_id") != existing.get("club_id"):
+            self._invalidate(merged.get("club_id"))
         return UpdateResult(1, 1)
 
     async def delete_one(self, query: dict):
@@ -486,7 +503,8 @@ class _PlayersFindCursor:
                 if self._sort_key:
                     self._fallback_cursor.sort(self._sort_key, self._sort_dir)
             return await self._fallback_cursor.to_list(length)
-        players = await self._store._load()
+        club = (self._query or {}).get("club_id")
+        players = await self._store._load(club if isinstance(club, str) and club else None)
         cursor = PlayersStoreCursor(players, self._query, self._projection)
         if self._sort_key:
             cursor.sort(self._sort_key, self._sort_dir)

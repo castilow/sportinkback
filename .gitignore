@@ -18,3 +18,4 @@ __pycache__/
 *.log
 .temp/
 supabase/.temp/
+.pytest_cache/

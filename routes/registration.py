@@ -26,6 +26,8 @@ from deps import (
     sign_up_with_supabase,
     sign_in_with_supabase,
     resend_supabase_signup,
+    request_password_recovery,
+    change_own_password,
     supabase_rpc,
     supabase_admin_find_user_by_email,
     invalidate_user_cache,
@@ -449,3 +451,48 @@ async def list_sports():
         except Exception:
             pass
     return presets
+
+
+# ------------------ Recuperación de contraseña ------------------
+class ForgotPasswordIn(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordIn(BaseModel):
+    access_token: str = Field(min_length=20, max_length=4096)
+    password: str = Field(min_length=8, max_length=128)
+
+
+def _allowed_frontend_origin(request: Request) -> Optional[str]:
+    """Origen del frontend para el enlace del correo. Solo orígenes de CORS_ORIGINS."""
+    import os
+
+    allowed = [o.strip().rstrip("/") for o in (os.environ.get("CORS_ORIGINS") or "").split(",") if o.strip()]
+    origin = (request.headers.get("origin") or "").strip().rstrip("/")
+    if origin and origin in allowed:
+        return origin
+    explicit = (os.environ.get("FRONTEND_URL") or "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    return allowed[0] if allowed else None
+
+
+@router.post("/auth/forgot-password")
+async def forgot_password(data: ForgotPasswordIn, request: Request):
+    await rate_limit_ip(request, "forgot_password", max_hits=5, window_s=3600)
+    origin = _allowed_frontend_origin(request)
+    try:
+        request_password_recovery(str(data.email), f"{origin}/restablecer" if origin else None)
+    except Exception as exc:  # respuesta genérica siempre: no revelamos si el correo existe
+        logger.warning("Recover falló: %s", exc)
+    return {"ok": True, "message": "Si el correo está registrado, recibirás un enlace para restablecer tu contraseña."}
+
+
+@router.post("/auth/reset-password")
+async def reset_password(data: ResetPasswordIn, request: Request):
+    await rate_limit_ip(request, "reset_password", max_hits=10, window_s=3600)
+    try:
+        change_own_password(data.access_token, data.password)
+    except HTTPException:
+        raise HTTPException(status_code=400, detail="El enlace ha caducado o no es válido. Solicita uno nuevo.")
+    return {"ok": True}

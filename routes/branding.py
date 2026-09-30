@@ -1,41 +1,58 @@
-"""Branding / White Label endpoints.
+"""Branding / White Label endpoints (una marca por CLUB).
 
-Modelo: varios "presets" de marca (uno por cliente/propuesta), cada uno con
-nombre, colores, logo y nombre de app. Exactamente uno está "activo" en
-cada momento: ese es el que ve el login real y el resto del software.
+Cada club tiene sus propios "presets" de marca (nombre, colores, logo) y
+exactamente uno activo. Los presets antiguos sin `club_id` pertenecen al club
+por defecto (Rayo Majadahonda).
 
-- GET  /branding                          -> público. Marca activa (la usa el login antes de autenticar).
-- PUT  /branding, POST /branding          -> admin. Alias entre sí: guardan cambios sobre el preset ACTIVO
-                                              (compatibilidad con el botón "Guardar y aplicar" ya existente).
-- POST /branding/logo                     -> admin. Sube un logo a Storage y devuelve su ruta.
-
-- GET    /branding/presets                -> admin. Lista todos los presets guardados.
-- POST   /branding/presets                -> admin. Crea un preset nuevo con nombre (no lo activa).
-- PUT    /branding/presets/{id}           -> admin. Actualiza los datos de un preset (nombre/colores/logo).
-- DELETE /branding/presets/{id}           -> admin. Borra un preset (no se puede borrar el activo ni el último).
-- POST   /branding/presets/{id}/activate  -> admin. Marca ese preset como el activo (lo publica en vivo).
+- GET  /branding?club=<slug>              -> público. Marca activa de ese club (o del club por defecto).
+                                              La usa el login antes de autenticar.
+- GET  /branding/me                       -> autenticado. Marca activa del club del usuario.
+- PUT/POST /branding                      -> admin. Guarda cambios sobre el preset ACTIVO de SU club.
+- POST /branding/logo                     -> admin. Sube un logo a Storage.
+- GET/POST /branding/presets              -> admin. Lista / crea presets de SU club.
+- PUT/DELETE /branding/presets/{id}       -> admin. Solo presets de SU club.
+- POST /branding/presets/{id}/activate    -> admin. Publica ese preset en su club.
 """
 from typing import Dict, List, Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from pydantic import BaseModel, Field, field_validator
 
 from deps import (
     db, now_iso, uuid, APP_NAME, MAX_UPLOAD_BYTES,
-    require_roles, put_object, _fetch_default_club_id,
+    require_roles, put_object, _fetch_default_club_id, get_current_user, require_club_context,
 )
 
 router = APIRouter()
 
 
 async def require_brand_admin(user=Depends(require_roles("admin"))):
-    """La marca es global (la pantalla de login la lee sin sesión): solo el admin del
-    club principal puede modificarla. Un club nuevo creado por registro NO puede
-    tocar la marca de los demás."""
-    default_club = await _fetch_default_club_id()
-    if not default_club or user.get("club_id") != default_club:
-        raise HTTPException(status_code=403, detail="Solo el club principal puede editar la marca")
+    """Solo el admin de un club puede editar la marca de SU club."""
+    require_club_context(user)
     return user
+
+
+async def _club_id_from_slug(slug: str) -> Optional[str]:
+    if not hasattr(db, "fetch_json_rows") or not slug:
+        return None
+    from postgres_compat import _sql_literal
+
+    rows = await db.fetch_json_rows(
+        f"select json_build_object('id', id::text)::text from public.clubs where slug = {_sql_literal(slug.lower())} limit 1;"
+    )
+    return rows[0]["id"] if rows else None
+
+
+async def _club_display_name(club_id: str) -> Optional[str]:
+    if not hasattr(db, "fetch_json_rows"):
+        return None
+    from postgres_compat import _sql_literal
+
+    rows = await db.fetch_json_rows(
+        f"select json_build_object('n', coalesce(nombre_corto, nombre))::text from public.clubs where id = {_sql_literal(club_id)}::uuid limit 1;"
+    )
+    return rows[0]["n"] if rows else None
+
 
 # Clave legacy: antes de existir presets, había un único documento "default".
 # Se conserva solo para poder migrarlo automáticamente al nuevo modelo.
@@ -49,10 +66,33 @@ DEFAULT_BRANDING = {
 }
 
 
+import re as _re
+
+_HEX = _re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
 class BrandingColors(BaseModel):
     primary: str = "#1d4ed8"
     navy: str = "#0a1f4d"
     accent: str = "#3b82f6"
+
+    @field_validator("primary", "navy", "accent")
+    @classmethod
+    def _valid_hex(cls, v: str) -> str:
+        if not _HEX.match(v or ""):
+            raise ValueError("Color inválido: usa formato #RRGGBB")
+        return v
+
+
+_MAX_LOGO_CHARS = 400_000  # ~300 KB en base64
+
+
+def _check_logo(v: Optional[str]) -> Optional[str]:
+    if v and len(v) > _MAX_LOGO_CHARS:
+        raise HTTPException(status_code=413, detail="El logo es demasiado grande. Usa una imagen de menos de 300 KB.")
+    if v and v.startswith("data:") and not v.startswith("data:image/"):
+        raise HTTPException(status_code=400, detail="El logo debe ser una imagen.")
+    return v
 
 
 class BrandingIn(BaseModel):
@@ -122,22 +162,27 @@ async def _migrate_legacy_if_needed() -> None:
     await db.branding.delete_one({"key": _LEGACY_KEY})
 
 
-async def _list_presets_raw() -> List[dict]:
+async def _list_presets_raw(club_id: str) -> List[dict]:
     await _migrate_legacy_if_needed()
-    docs = await db.branding.find(None, {"_id": 0}).to_list(500)
-    # Filtramos en Python (en vez de en la query) por compatibilidad con ambos backends (Mongo/Postgres).
-    return [d for d in docs if d.get("id")]
+    default_club = await _fetch_default_club_id()
+    docs = await db.branding.find(None, {"_id": 0}).to_list(2000)
+    # Filtro en Python por compatibilidad Mongo/Postgres. Sin club_id = club por defecto.
+    return [d for d in docs if d.get("id") and (d.get("club_id") or default_club) == club_id]
 
 
-async def _get_active_raw() -> dict:
-    presets = await _list_presets_raw()
+async def _get_active_raw(club_id: str) -> dict:
+    presets = await _list_presets_raw(club_id)
     if not presets:
-        # Primer arranque: no existe ningún preset todavía -> creamos "Predeterminado".
+        # Primer uso de este club: creamos su preset inicial con el nombre del club.
+        default_club = await _fetch_default_club_id()
+        name = None if club_id == default_club else await _club_display_name(club_id)
         seed = {
             "id": str(uuid.uuid4()),
+            "club_id": club_id,
             "name": "Predeterminado",
             "active": True,
             **DEFAULT_BRANDING,
+            "appName": name or DEFAULT_BRANDING["appName"],
             "updated_at": now_iso(),
             "updated_by": None,
         }
@@ -146,7 +191,6 @@ async def _get_active_raw() -> dict:
     active = next((p for p in presets if p.get("active")), None)
     if active:
         return active
-    # Ninguno marcado como activo (no debería pasar) -> activamos el más reciente.
     presets.sort(key=lambda p: p.get("updated_at") or "", reverse=True)
     fallback = presets[0]
     await db.branding.update_one({"id": fallback["id"]}, {"$set": {"active": True}})
@@ -155,19 +199,35 @@ async def _get_active_raw() -> dict:
 
 
 @router.get("/branding")
-async def get_branding():
-    """Marca activa. Público: el login la necesita antes de autenticar."""
-    active = await _get_active_raw()
-    return _clean(active)
+async def get_branding(club: Optional[str] = Query(default=None, max_length=80)):
+    """Marca activa. Público: el login la necesita antes de autenticar.
+    Con ?club=<slug> devuelve la de ese club; sin él, la del club por defecto."""
+    club_id = await _club_id_from_slug(club) if club else None
+    if not club_id:
+        club_id = await _fetch_default_club_id()
+    if not club_id:
+        return dict(DEFAULT_BRANDING)
+    return _clean(await _get_active_raw(club_id))
+
+
+@router.get("/branding/me")
+async def get_my_branding(user=Depends(get_current_user)):
+    """Marca activa del club del usuario autenticado."""
+    club_id = user.get("club_id")
+    if not club_id:
+        return dict(DEFAULT_BRANDING)
+    return _clean(await _get_active_raw(club_id))
 
 
 async def _save_active(payload: BrandingIn, user: dict) -> dict:
-    active = await _get_active_raw()
+    club_id = require_club_context(user)
+    active = await _get_active_raw(club_id)
     data = {
-        "appName": payload.appName,
-        "logoUrl": payload.logoUrl,
+        "appName": payload.appName.strip() or DEFAULT_BRANDING["appName"],
+        "logoUrl": _check_logo(payload.logoUrl),
         "wordmarkUrl": payload.wordmarkUrl,
-        "colors": payload.colors.dict(),
+        "colors": payload.colors.model_dump(),
+        "club_id": club_id,
         "updated_at": now_iso(),
         "updated_by": user.get("id"),
     }
@@ -206,23 +266,35 @@ async def upload_logo(file: UploadFile = File(...), user=Depends(require_brand_a
 # cuál está publicada en el software real.
 # ------------------------------------------------------------------
 
+async def _own_preset(preset_id: str, club_id: str) -> dict:
+    presets = await _list_presets_raw(club_id)
+    target = next((p for p in presets if p.get("id") == preset_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="Preset no encontrado")
+    return target
+
+
 @router.get("/branding/presets")
 async def list_presets(user=Depends(require_brand_admin)):
-    presets = await _list_presets_raw()
+    club_id = require_club_context(user)
+    await _get_active_raw(club_id)  # garantiza que existe al menos uno
+    presets = await _list_presets_raw(club_id)
     presets.sort(key=lambda p: p.get("updated_at") or "", reverse=True)
     return [_clean_preset(p) for p in presets]
 
 
 @router.post("/branding/presets")
 async def create_preset(payload: PresetIn, user=Depends(require_brand_admin)):
+    club_id = require_club_context(user)
     data = {
         "id": str(uuid.uuid4()),
+        "club_id": club_id,
         "name": payload.name.strip() or "Sin nombre",
         "active": False,
         "appName": payload.appName,
-        "logoUrl": payload.logoUrl,
+        "logoUrl": _check_logo(payload.logoUrl),
         "wordmarkUrl": payload.wordmarkUrl,
-        "colors": payload.colors.dict(),
+        "colors": payload.colors.model_dump(),
         "updated_at": now_iso(),
         "updated_by": user.get("id"),
     }
@@ -232,20 +304,19 @@ async def create_preset(payload: PresetIn, user=Depends(require_brand_admin)):
 
 @router.put("/branding/presets/{preset_id}")
 async def update_preset(preset_id: str, payload: PresetUpdate, user=Depends(require_brand_admin)):
-    existing = await db.branding.find_one({"id": preset_id}, {"_id": 0})
-    if not existing:
-        raise HTTPException(status_code=404, detail="Preset no encontrado")
-    patch: Dict = {"updated_at": now_iso(), "updated_by": user.get("id")}
+    club_id = require_club_context(user)
+    existing = await _own_preset(preset_id, club_id)
+    patch: Dict = {"club_id": club_id, "updated_at": now_iso(), "updated_by": user.get("id")}
     if payload.name is not None:
         patch["name"] = payload.name.strip() or existing.get("name") or "Sin nombre"
     if payload.appName is not None:
         patch["appName"] = payload.appName
     if payload.logoUrl is not None:
-        patch["logoUrl"] = payload.logoUrl
+        patch["logoUrl"] = _check_logo(payload.logoUrl)
     if payload.wordmarkUrl is not None:
         patch["wordmarkUrl"] = payload.wordmarkUrl
     if payload.colors is not None:
-        patch["colors"] = payload.colors.dict()
+        patch["colors"] = payload.colors.model_dump()
     await db.branding.update_one({"id": preset_id}, {"$set": patch})
     updated = await db.branding.find_one({"id": preset_id}, {"_id": 0})
     return _clean_preset(updated)
@@ -253,21 +324,23 @@ async def update_preset(preset_id: str, payload: PresetUpdate, user=Depends(requ
 
 @router.delete("/branding/presets/{preset_id}")
 async def delete_preset(preset_id: str, user=Depends(require_brand_admin)):
-    presets = await _list_presets_raw()
+    club_id = require_club_context(user)
+    presets = await _list_presets_raw(club_id)
     target = next((p for p in presets if p.get("id") == preset_id), None)
     if not target:
         raise HTTPException(status_code=404, detail="Preset no encontrado")
     if len(presets) <= 1:
-        raise HTTPException(status_code=400, detail="No podés borrar el único preset que queda")
+        raise HTTPException(status_code=400, detail="No puedes borrar el único preset que queda")
     if target.get("active"):
-        raise HTTPException(status_code=400, detail="No podés borrar el preset activo. Activá otro primero.")
+        raise HTTPException(status_code=400, detail="No puedes borrar el preset activo. Activa otro primero.")
     await db.branding.delete_one({"id": preset_id})
     return {"ok": True}
 
 
 @router.post("/branding/presets/{preset_id}/activate")
 async def activate_preset(preset_id: str, user=Depends(require_brand_admin)):
-    presets = await _list_presets_raw()
+    club_id = require_club_context(user)
+    presets = await _list_presets_raw(club_id)
     target = next((p for p in presets if p.get("id") == preset_id), None)
     if not target:
         raise HTTPException(status_code=404, detail="Preset no encontrado")
@@ -276,7 +349,7 @@ async def activate_preset(preset_id: str, user=Depends(require_brand_admin)):
             await db.branding.update_one({"id": p["id"]}, {"$set": {"active": False}})
     await db.branding.update_one(
         {"id": preset_id},
-        {"$set": {"active": True, "updated_at": now_iso(), "updated_by": user.get("id")}},
+        {"$set": {"active": True, "club_id": club_id, "updated_at": now_iso(), "updated_by": user.get("id")}},
     )
     updated = await db.branding.find_one({"id": preset_id}, {"_id": 0})
     return _clean_preset(updated)
