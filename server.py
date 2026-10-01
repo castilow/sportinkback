@@ -1318,28 +1318,49 @@ async def import_commit(batch_id: str, user=Depends(require_roles("admin"))):
         raise HTTPException(status_code=400, detail="Lote ya importado")
     if batch.get("club_id") and batch.get("club_id") != club_id:
         raise HTTPException(status_code=403, detail="Ese lote pertenece a otro club")
-    to_insert = []
-    sport_id = await _club_sport_id(club_id)
+    import logging
+    log = logging.getLogger("sportink.import")
+    try:
+        sport_id = await _club_sport_id(club_id)
+    except Exception as e:
+        log.exception("import: no se pudo resolver el deporte del club")
+        sport_id = None
     team_cache: dict = {}
     created_teams = 0
-    known_before = set((await _existing_team_map(club_id)).keys())
-    for r in batch["rows"]:
-        tname = (r.get("team") or r.get("category") or "").strip()
-        key = tname.lower()
-        if tname and key not in team_cache:
-            team_cache[key] = await _ensure_team(club_id, sport_id, tname, r.get("category") or tname)
-            if key not in known_before:
-                created_teams += 1
-        if tname:
-            r["team_id"], r["team"] = team_cache[key]
-        r["id"] = str(uuid.uuid4())
-        r["club_id"] = club_id
-        r["created_at"] = now_iso()
-        to_insert.append(r)
-    if to_insert:
-        await db.players.insert_many(to_insert)
-    await db.import_batches.update_one({"id": batch_id}, {"$set": {"committed": True}})
-    return {"imported": len(to_insert), "teams_created": created_teams}
+    try:
+        known_before = set((await _existing_team_map(club_id)).keys())
+    except Exception:
+        log.exception("import: no se pudieron leer los equipos existentes")
+        known_before = set()
+    imported = 0
+    failures: list = []
+    for i, r in enumerate(batch["rows"]):
+        try:
+            tname = (r.get("team") or r.get("category") or "").strip()
+            key = tname.lower()
+            if tname and key not in team_cache:
+                try:
+                    team_cache[key] = await _ensure_team(club_id, sport_id, tname, r.get("category") or tname)
+                    if key not in known_before and team_cache[key][0]:
+                        created_teams += 1
+                except Exception:
+                    log.exception("import: no se pudo crear el equipo %s", tname)
+                    team_cache[key] = (None, tname)
+            if tname:
+                r["team_id"], r["team"] = team_cache[key]
+            r["id"] = str(uuid.uuid4())
+            r["club_id"] = club_id
+            r["created_at"] = now_iso()
+            await db.players.insert_one(r)
+            imported += 1
+        except Exception as e:
+            log.exception("import: fallo en la fila %s", i + 2)
+            failures.append({"row": i + 2, "name": r.get("name"), "error": f"{type(e).__name__}: {e}"[:300]})
+    if imported == 0 and failures:
+        raise HTTPException(status_code=500, detail=f"No se pudo importar ningún jugador. Primer error (fila {failures[0]['row']}): {failures[0]['error']}")
+    if imported:
+        await db.import_batches.update_one({"id": batch_id}, {"$set": {"committed": True}})
+    return {"imported": imported, "teams_created": created_teams, "failed": len(failures), "errors": failures[:10]}
 
 
 # ------------------ Export Excel ------------------
