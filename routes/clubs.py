@@ -8,6 +8,7 @@ import io
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from players_store import TEMPORADA
 
 from deps import (
     db,
@@ -25,8 +26,9 @@ class TeamIn(BaseModel):
     nombre: str = Field(..., min_length=1, max_length=120)
     categoria: str = Field("", max_length=120)
     genero: Literal["MASCULINO", "FEMENINO", "MIXTO"] = "MIXTO"
-    temporada: str = Field("25-26", max_length=16)
+    temporada: str = Field(TEMPORADA, max_length=16)
     entidad: Literal["club", "fundacion"] = "club"
+    coach_name: Optional[str] = Field(None, max_length=160)
     sport_slug: str = Field("futbol", max_length=40)
     activo: bool = True
 
@@ -40,6 +42,7 @@ class TeamOut(BaseModel):
     genero: Optional[str] = None
     temporada: str
     entidad: str = "club"
+    coach_name: Optional[str] = None
     activo: bool = True
     num_jugadores: int = 0
 
@@ -82,7 +85,7 @@ async def get_my_club(user=Depends(get_current_user)):
 
 @router.get("/teams", response_model=List[TeamOut])
 async def list_teams(
-    temporada: Optional[str] = None,
+    temporada: Optional[str] = TEMPORADA,
     include_inactive: bool = False,
     user=Depends(get_current_user),
 ):
@@ -113,6 +116,7 @@ async def list_teams(
           t.genero,
           t.temporada,
           t.entidad,
+          t.coach_name,
           t.activo,
           count(p.id)::int as num_jugadores
         from public.teams t
@@ -171,7 +175,7 @@ async def create_team(data: TeamIn, user=Depends(require_roles("admin", "coordin
         await db.execute(
             f"""
             insert into public.teams
-              (id, club_id, sport_id, nombre, categoria, genero, temporada, entidad, activo)
+              (id, club_id, sport_id, nombre, categoria, genero, temporada, entidad, coach_name, activo)
             values (
               {_sql_literal(team_id)}::uuid,
               {_sql_literal(club_id)}::uuid,
@@ -181,6 +185,7 @@ async def create_team(data: TeamIn, user=Depends(require_roles("admin", "coordin
               {_sql_literal(data.genero)},
               {_sql_literal(data.temporada)},
               {_sql_literal(data.entidad)},
+              {_sql_literal(data.coach_name.strip() if data.coach_name is not None else None)},
               {str(data.activo).lower()}
             );
             """
@@ -199,6 +204,7 @@ async def create_team(data: TeamIn, user=Depends(require_roles("admin", "coordin
         "genero": data.genero,
         "temporada": data.temporada,
         "entidad": data.entidad,
+        "coach_name": data.coach_name.strip() if data.coach_name is not None else None,
         "activo": data.activo,
         "num_jugadores": 0,
     }
@@ -230,6 +236,7 @@ async def update_team(team_id: str, data: TeamIn, user=Depends(require_roles("ad
           genero = {_sql_literal(data.genero)},
           temporada = {_sql_literal(data.temporada)},
           entidad = {_sql_literal(data.entidad)},
+          coach_name = {_sql_literal(data.coach_name.strip()) if data.coach_name is not None else 'coach_name'},
           activo = {str(data.activo).lower()},
           updated_at = now()
         where id = {_sql_literal(team_id)}::uuid
@@ -249,7 +256,7 @@ async def update_team(team_id: str, data: TeamIn, user=Depends(require_roles("ad
         f"""
         select
           t.id::text as id, t.club_id::text as club_id, t.sport_id::text as sport_id,
-          t.nombre, t.categoria, t.genero, t.temporada, t.entidad, t.activo,
+          t.nombre, t.categoria, t.genero, t.temporada, t.entidad, t.coach_name, t.activo,
           count(p.id)::int as num_jugadores
         from public.teams t
         left join public.players p on p.team_id = t.id
@@ -287,6 +294,7 @@ _TEAM_COLS = {
     "genero": ["género", "genero", "gender", "sexo", "gènere"],
     "entidad": ["entidad", "entitat", "entity"],
     "temporada": ["temporada", "season"],
+    "coach_name": ["entrenador", "nombre del entrenador", "coach", "coach_name"],
 }
 MAX_TEAM_IMPORT = 500
 
@@ -337,12 +345,12 @@ async def teams_import_template(user=Depends(require_roles("admin", "coordinator
     import pandas as pd
 
     df = pd.DataFrame([
-        {"Equipo": "Alevín A", "Categoría": "Alevín", "Género": "Masculino", "Entidad": "Club", "Temporada": "25-26"},
-        {"Equipo": "Cadete Femenino", "Categoría": "Cadete", "Género": "Femenino", "Entidad": "Club", "Temporada": "25-26"},
-        {"Equipo": "Sub-12 Mixto", "Categoría": "Sub-12", "Género": "Mixto", "Entidad": "Club", "Temporada": "25-26"},
+        {"Equipo": "Alevín A", "Categoría": "Alevín", "Género": "Masculino", "Entidad": "Club", "Temporada": TEMPORADA, "Entrenador": ""},
+        {"Equipo": "Cadete Femenino", "Categoría": "Cadete", "Género": "Femenino", "Entidad": "Club", "Temporada": TEMPORADA, "Entrenador": ""},
+        {"Equipo": "Sub-12 Mixto", "Categoría": "Sub-12", "Género": "Mixto", "Entidad": "Club", "Temporada": TEMPORADA, "Entrenador": ""},
     ])
     notes = pd.DataFrame({"Instrucciones": [
-        "Obligatoria solo la columna Equipo. Categoría, Género (Masculino/Femenino/Mixto), Entidad (Club/Fundación) y Temporada son opcionales.",
+        "Obligatoria solo la columna Equipo. Categoría, Género (Masculino/Femenino/Mixto), Entidad (Club/Fundación), Temporada y Entrenador son opcionales.",
         "Si dejas la Categoría vacía se usa el nombre del equipo. Los equipos que ya existan se omiten.",
         "Borra las filas de ejemplo antes de subir tu listado.",
     ]})
@@ -405,14 +413,15 @@ async def import_teams(file: UploadFile = File(...), user=Depends(require_roles(
         genero = _norm_genero(_cell(row[mapping["genero"]])) if "genero" in mapping else "MIXTO"
         ent_raw = _cell(row[mapping["entidad"]]).lower() if "entidad" in mapping else ""
         entidad = "fundacion" if ent_raw.startswith("fund") else "club"
-        temporada = (_cell(row[mapping["temporada"]]) if "temporada" in mapping else "")[:16] or "25-26"
+        temporada = (_cell(row[mapping["temporada"]]) if "temporada" in mapping else "")[:16] or TEMPORADA
+        coach_name = (_cell(row[mapping["coach_name"]]) if "coach_name" in mapping else "")[:160] or None
         try:
             res = await _sql_rows(
                 f"""
-                insert into public.teams (club_id, sport_id, nombre, categoria, genero, temporada, entidad, activo)
+                insert into public.teams (club_id, sport_id, nombre, categoria, genero, temporada, entidad, coach_name, activo)
                 values ({_sql_literal(club_id)}::uuid, {_sql_literal(sport_id)}::uuid, {_sql_literal(nombre)},
                         {_sql_literal(categoria)}, {_sql_literal(genero)}, {_sql_literal(temporada)},
-                        {_sql_literal(entidad)}, true)
+                        {_sql_literal(entidad)}, {_sql_literal(coach_name)}, true)
                 on conflict (club_id, sport_id, nombre, temporada) do nothing
                 returning json_build_object('id', id::text)::text;
                 """

@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import uuid
 from datetime import date
 from typing import Any, Optional
 
 from postgres_compat import AsyncCursor, DeleteResult, InsertOneResult, UpdateResult, _sql_literal
 
-TEMPORADA = "25-26"
+TEMPORADA = os.environ.get("APP_SEASON", "26-27").strip() or "26-27"
 _use_sql: Optional[bool] = None
 
 ABRV_TO_CATEGORY = {
@@ -51,6 +52,7 @@ def sql_row_to_player(row: dict) -> dict:
         "dni": row.get("dni") or "",
         "birthdate": row.get("fecha_nacimiento"),
         "category": _category_label(row),
+        "season": row.get("temporada") or TEMPORADA,
         "team": team,
         "team_id": str(row["team_id"]) if row.get("team_id") else None,
         "club_id": str(row["club_id"]) if row.get("club_id") else None,
@@ -105,10 +107,10 @@ async def relational_players_enabled(db: Any) -> bool:
         _use_sql = False
         return False
     try:
-        count = await db.execute_scalar(
-            f"select count(*)::text from public.players where temporada = {_sql_literal(TEMPORADA)} limit 1;"
+        available = await db.execute_scalar(
+            "select (to_regclass('public.players') is not null)::text;"
         )
-        _use_sql = int(count or "0") > 0
+        _use_sql = str(available or "").strip().lower() in ("true", "t", "1")
     except Exception:
         _use_sql = None
         raise
@@ -125,6 +127,7 @@ select
   p.categoria_abrv,
   p.categoria,
   p.equipo,
+  p.temporada,
   p.club_id::text as club_id,
   p.team_id::text as team_id,
   p.notas,
@@ -628,7 +631,7 @@ async def save_office_details(
 
 
 def install_players_store(db: Any) -> Any:
-    """Envuelve la colección players para usar SQL cuando exista temporada 25-26."""
+    """Envuelve la colección players para usar la tabla SQL de jugadores."""
     if not hasattr(db, "_collections"):
         return db
     fallback = db._collections.get("players") or db.players

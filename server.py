@@ -16,6 +16,7 @@ from fastapi.responses import StreamingResponse, Response as FastAPIResponse
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field, EmailStr
+from players_store import TEMPORADA
 # pandas/reportlab se importan lazy en export Excel/PDF para cold start más rápido
 
 # Shared infrastructure lives in deps.py (imported by the feature routers too)
@@ -31,7 +32,7 @@ from deps import (
     supabase_admin_find_user_by_email,
 )
 
-CATEGORIES = ["Prebenjamín", "Benjamín", "Alevín", "Infantil", "Cadete", "Juvenil", "Senior/Filial", "Femenino"]
+CATEGORIES = ["Debutantes", "Prebenjamín", "Benjamín", "Alevín", "Infantil", "Cadete", "Juvenil", "Senior/Filial", "Femenino"]
 ENTITIES = ("club", "fundacion")
 ROLES = ("admin", "coordinator", "coach", "office", "physio")
 KIT_ITEM_CODES = [
@@ -240,7 +241,7 @@ class PlayerKitItemIn(BaseModel):
 
 
 class PlayerKitIn(BaseModel):
-    season: str = "2025/26"
+    season: str = "20" + TEMPORADA.replace("-", "/")
     items: List[PlayerKitItemIn] = Field(default_factory=list)
     notes: str = ""
 
@@ -799,6 +800,7 @@ async def _resolve_team_name(club_id: str, team_id: Optional[str], team_name: st
             from public.teams
             where id = {_sql_literal(team_id)}::uuid
               and club_id = {_sql_literal(club_id)}::uuid
+              and temporada = {_sql_literal(TEMPORADA)}
               and activo = true
             limit 1;
             """
@@ -813,6 +815,7 @@ async def _resolve_team_name(club_id: str, team_id: Optional[str], team_name: st
             from public.teams
             where club_id = {_sql_literal(club_id)}::uuid
               and lower(nombre) = lower({_sql_literal(team_name.strip())})
+              and temporada = {_sql_literal(TEMPORADA)}
               and activo = true
             limit 1;
             """
@@ -829,7 +832,7 @@ async def players_categories(user=Depends(get_current_user)):
     cats = set()
     try:
         rows = await db.fetch_json_rows(
-            f"select json_build_object('categoria', categoria)::text from (select distinct categoria from public.teams where club_id = {_sql_literal(club_id)}::uuid and activo = true and categoria is not null) t;"
+            f"select json_build_object('categoria', categoria)::text from (select distinct categoria from public.teams where club_id = {_sql_literal(club_id)}::uuid and temporada = {_sql_literal(TEMPORADA)} and activo = true and categoria is not null) t;"
         )
         cats.update(r["categoria"] for r in rows if r.get("categoria"))
     except Exception:
@@ -1155,7 +1158,8 @@ async def _existing_team_map(club_id: str) -> dict:
     rows = await db.fetch_json_rows(
         f"""
         select id::text as id, nombre from public.teams
-        where club_id = {_sql_literal(club_id)}::uuid and activo = true;
+        where club_id = {_sql_literal(club_id)}::uuid and activo = true
+          and temporada = {_sql_literal(TEMPORADA)};
         """
     )
     return {r["nombre"].strip().lower(): r for r in rows}
@@ -1168,6 +1172,7 @@ async def _ensure_team(club_id: str, sport_id: Optional[str], name: str, categor
         f"""
         select id::text as id, nombre from public.teams
         where club_id = {_sql_literal(club_id)}::uuid and lower(nombre) = lower({_sql_literal(name)})
+          and temporada = {_sql_literal(TEMPORADA)}
         order by activo desc limit 1;
         """
     )
@@ -1179,7 +1184,7 @@ async def _ensure_team(club_id: str, sport_id: Optional[str], name: str, categor
         f"""
         insert into public.teams (club_id, sport_id, nombre, categoria, genero, temporada, entidad, activo)
         values ({_sql_literal(club_id)}::uuid, {_sql_literal(sport_id)}::uuid, {_sql_literal(name)},
-                {_sql_literal(category)}, 'MIXTO', '25-26', 'club', true)
+                {_sql_literal(category)}, 'MIXTO', {_sql_literal(TEMPORADA)}, 'club', true)
         on conflict (club_id, sport_id, nombre, temporada) do update set activo = true
         returning id::text as id, nombre;
         """
@@ -2603,7 +2608,7 @@ async def seed_demo_players():
 
     if await relational_players_enabled(db):
         logger.info(
-            "Plantilla SQL temporada 25-26 detectada: omitiendo jugadores demo JSON."
+            "Tabla SQL de jugadores detectada: omitiendo jugadores demo JSON."
         )
         return
     today = date.today()
@@ -2900,7 +2905,7 @@ async def _startup():
 
     try:
         if await relational_players_enabled(db):
-            logger.info("Datos de jugadores: tabla SQL public.players (temporada 25-26)")
+            logger.info("Datos de jugadores: tabla SQL public.players (temporada %s)", TEMPORADA)
     except Exception as exc:
         logger.warning("No se pudo comprobar jugadores SQL: %s", exc)
 

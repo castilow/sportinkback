@@ -15,6 +15,7 @@ from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, EmailStr, Field, field_validator
+from players_store import TEMPORADA
 
 from deps import (
     db,
@@ -94,7 +95,7 @@ class ClubRegistrationIn(BaseModel):
     nombre: str = Field(..., min_length=2, max_length=160)
     nombre_corto: str = Field("", max_length=80)
     ciudad: str = Field("", max_length=120)
-    temporada: str = Field("25-26", max_length=16)
+    temporada: str = Field(TEMPORADA, max_length=16)
     slug: Optional[str] = Field(None, max_length=80)
 
 
@@ -153,7 +154,7 @@ def _build_payload(data: PublicRegistrationIn) -> dict:
             "nombre": data.club.nombre.strip(),
             "nombre_corto": (data.club.nombre_corto or data.club.nombre).strip(),
             "ciudad": (data.club.ciudad or "").strip(),
-            "temporada": data.club.temporada.strip() or "25-26",
+            "temporada": data.club.temporada.strip() or TEMPORADA,
             "slug": club_slug,
         },
         "sport": {"slug": sport_slug, "nombre": sport_name},
@@ -164,7 +165,7 @@ def _build_payload(data: PublicRegistrationIn) -> dict:
                 "categoria": (t.categoria or t.nombre).strip(),
                 "genero": t.genero,
                 "entidad": t.entidad,
-                "temporada": data.club.temporada.strip() or "25-26",
+                "temporada": data.club.temporada.strip() or TEMPORADA,
             }
             for t in data.teams
         ],
