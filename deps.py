@@ -648,10 +648,17 @@ def require_club_context(user: dict) -> str:
 
 
 def supabase_admin_list_users() -> list[dict]:
-    resp = _supabase_admin_request("GET", "/auth/v1/admin/users?page=1&per_page=1000")
-    if resp.status_code >= 300:
-        raise RuntimeError(_supabase_error_message(resp))
-    return resp.json().get("users", [])
+    users = []
+    page = 1
+    while True:
+        resp = _supabase_admin_request("GET", f"/auth/v1/admin/users?page={page}&per_page=1000")
+        if resp.status_code >= 300:
+            raise RuntimeError(_supabase_error_message(resp))
+        batch = resp.json().get("users", [])
+        users.extend(batch)
+        if len(batch) < 1000:
+            return users
+        page += 1
 
 
 def supabase_admin_find_user_by_email(email: str) -> Optional[dict]:
@@ -660,6 +667,45 @@ def supabase_admin_find_user_by_email(email: str) -> Optional[dict]:
         if (user.get("email") or "").lower() == email:
             return user
     return None
+
+
+def get_supabase_staff_user(auth_user_id: str) -> dict:
+    # Validar antes de interpolar el identificador en la ruta administrativa.
+    auth_user_id = str(uuid.UUID(auth_user_id))
+    resp = _supabase_admin_request("GET", f"/auth/v1/admin/users/{auth_user_id}")
+    if resp.status_code >= 300:
+        raise RuntimeError(_supabase_error_message(resp))
+    return resp.json().get("user") or resp.json()
+
+
+def update_supabase_staff_user(auth_user_id: str, *, email: Optional[str] = None,
+                              name: Optional[str] = None, role: Optional[str] = None,
+                              assigned_teams: Optional[list] = None,
+                              app_user_id: Optional[str] = None) -> dict:
+    """Actualiza un acceso existente. No crea cuentas ni cambia contraseñas."""
+    auth_user_id = str(uuid.UUID(auth_user_id))
+    payload = {}
+    if email is not None:
+        payload["email"] = email.lower()
+    metadata = {key: value for key, value in {
+        "name": name, "role": role, "assigned_teams": assigned_teams, "app_user_id": app_user_id,
+    }.items() if value is not None}
+    if metadata:
+        payload["user_metadata"] = metadata
+    if role is not None:
+        payload["app_metadata"] = {"role": role}
+    resp = _supabase_admin_request(
+        "PUT", f"/auth/v1/admin/users/{auth_user_id}", json=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    if resp.status_code >= 300:
+        error = _supabase_error_message(resp)
+        if resp.status_code in (409, 422) and any(
+            text in error.lower() for text in ("already registered", "already been registered", "email_exists")
+        ):
+            raise HTTPException(status_code=409, detail="Ya existe una cuenta con ese correo")
+        raise RuntimeError(error)
+    return resp.json().get("user") or resp.json()
 
 
 def ensure_supabase_staff_user(email: str, password: str, *, name: str, role: str, assigned_teams: Optional[list] = None, app_user_id: Optional[str] = None, reset_password: bool = False) -> dict:
@@ -790,6 +836,8 @@ __all__ = [
     "require_roles",
     "require_club_context",
     "ensure_supabase_staff_user",
+    "get_supabase_staff_user",
+    "update_supabase_staff_user",
     "delete_supabase_auth_user",
     "create_parent_chat_session",
     "_parent_or_staff",
