@@ -504,15 +504,18 @@ async def list_all_sheets(
 def build_convocation_text(data, names: list[str]) -> str:
     """Texto de la convocatoria listo para pegar en WhatsApp."""
     home_away = "LOCAL" if data.is_home else "VISITANTE"
-    return (
-        f"📣 CONVOCATORIA · {data.match_date} {data.match_time}\n"
-        f"{home_away}: {data.team} vs {data.opponent}\n"
-        f"{data.venue}\n"
-        + (f"⏰ Citación: {data.meeting_time} en {data.meeting_place}\n" if data.meeting_time else "")
-        + (f"📝 {data.notes}\n" if data.notes else "")
-        + f"\nConvocados ({len(names)}):\n"
-        + "\n".join(f"• {n}" for n in names)
-    )
+    lines = [
+        f"📣 CONVOCATORIA · {data.match_date} {data.match_time}".strip(),
+        f"{home_away}: {data.team} vs {data.opponent}",
+    ]
+    if data.venue:
+        lines.append(data.venue)
+    if data.meeting_time:
+        lines.append(f"⏰ Citación: {data.meeting_time}" + (f" en {data.meeting_place}" if data.meeting_place else ""))
+    if data.notes:
+        lines.append(f"📝 {data.notes}")
+    lines += ["", f"Convocados ({len(names)}):"] + [f"• {n}" for n in names]
+    return "\n".join(lines)
 
 
 @router.post("/convocations")
