@@ -2,7 +2,7 @@
 import asyncio
 import io
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse, Response as FastAPIResponse
@@ -114,6 +114,8 @@ class MatchSheetIn(BaseModel):
     # los minutos vivían en un endpoint aparte (/minutes) que la interfaz del
     # entrenador no llegaba a usar.
     total_match_minutes: int = 0
+    formation: str = ""
+    formation_positions: Any = None
     starters: List[dict] = []
     substitutes: List[dict] = []
     outstanding_club: List[dict] = []
@@ -200,18 +202,60 @@ async def training_photo(sheet_id: str, request: Request):
 LOW_MINUTES_PCT = 30
 
 
-def _match_sheet_minutes(doc: dict) -> list[dict]:
+# Duración estándar (minutos) por categoría, igual que en el frontend.
+_CATEGORY_MATCH_MINUTES = (
+    ("prebenjamin", 40), ("benjamin", 40), ("alevin", 50), ("infantil", 60),
+    ("cadete", 70), ("juvenil", 90), ("senior", 90), ("filial", 90), ("femenino", 90),
+)
+
+
+def default_match_minutes(category: str) -> int:
+    import unicodedata
+    norm = unicodedata.normalize("NFKD", category or "").encode("ascii", "ignore").decode().lower()
+    for key, mins in _CATEGORY_MATCH_MINUTES:
+        if key in norm:
+            return mins
+    return 60
+
+
+def _to_int(val) -> Optional[int]:
+    try:
+        n = int(float(str(val).strip()))
+    except (TypeError, ValueError):
+        return None
+    return n
+
+
+def _row_minutes(row: dict, is_starter: bool, total: int) -> int:
+    """Minutos jugados de una fila de la hoja.
+
+    Usa ``minutes`` si el frontend lo manda. Si no, lo calcula con el minuto
+    de cambio: un titular juega hasta que sale (o el partido entero); un
+    suplente juega desde que entra hasta el final (0 si no entra).
+    """
+    explicit = _to_int(row.get("minutes"))
+    if explicit is not None and explicit >= 0:
+        return min(explicit, total) if total > 0 else explicit
+    sub = _to_int(row.get("substitution_minute"))
+    if total <= 0:
+        return 0
+    if is_starter:
+        return min(sub, total) if sub and sub > 0 else total
+    return max(0, total - sub) if sub and sub > 0 else 0
+
+
+def _match_sheet_minutes(doc: dict, total: int = 0) -> list[dict]:
     """Minutos por jugador a partir de titulares y suplentes de la hoja."""
     out = []
-    for row in (doc.get("starters") or []) + (doc.get("substitutes") or []):
-        pid = row.get("player_id") or row.get("id")
-        if not pid:
-            continue
-        try:
-            minutes = int(row.get("minutes") or 0)
-        except (TypeError, ValueError):
-            minutes = 0
-        out.append({"player_id": pid, "name": row.get("name", ""), "minutes": minutes})
+    for is_starter, key in ((True, "starters"), (False, "substitutes")):
+        for row in doc.get(key) or []:
+            pid = row.get("player_id") or row.get("id")
+            if not pid:
+                continue
+            minutes = _row_minutes(row, is_starter, total)
+            row["minutes"] = minutes  # queda guardado en la hoja para verlo sin PDF
+            out.append({"player_id": pid, "name": row.get("name", ""), "minutes": minutes,
+                        "starter": is_starter})
     return out
 
 
@@ -228,12 +272,14 @@ async def create_match_sheet(data: MatchSheetIn, user=Depends(require_roles("coa
     doc["date"] = data.match_date
     doc["kind"] = "partido"
 
-    minutes_rows = _match_sheet_minutes(doc)
-    total = int(doc.get("total_match_minutes") or 0)
+    total = int(doc.get("total_match_minutes") or 0) or default_match_minutes(data.category)
+    doc["total_match_minutes"] = total
+    minutes_rows = _match_sheet_minutes(doc, total)
     doc["minutes_records"] = minutes_rows
     doc["minutes_total_played"] = sum(r["minutes"] for r in minutes_rows)
 
-    doc["club_id"] = require_club_context(user)
+    club_id = require_club_context(user)
+    doc["club_id"] = club_id
     await db.match_sheets.insert_one(doc)
 
     # Registro de minutos para /stats y el panel de coordinación. Antes lo
@@ -251,6 +297,7 @@ async def create_match_sheet(data: MatchSheetIn, user=Depends(require_roles("coa
             "records": minutes_rows,
             "coach_id": user["id"],
             "match_sheet_id": doc["id"],
+            "club_id": club_id,
             "created_at": now_iso(),
         })
 
@@ -271,6 +318,11 @@ async def create_match_sheet(data: MatchSheetIn, user=Depends(require_roles("coa
                 "team": data.team,
                 "source": "match_sheet",
                 "match_sheet_id": doc["id"],
+                "club_id": club_id,
+                "player_name": next((r["name"] for r in minutes_rows if r["player_id"] == a["player_id"]), ""),
+                "opponent": data.opponent,
+                "minutes": next((r["minutes"] for r in minutes_rows if r["player_id"] == a["player_id"]), 0),
+                "total_match_minutes": total,
                 "created_at": now_iso(),
                 "read": False,
             })
@@ -329,10 +381,13 @@ def _build_match_sheet_pdf(sheet: dict) -> bytes:
         story.append(Paragraph(title, h2))
         if not rows:
             story.append(Paragraph("—", styles["Normal"])); return
-        data = [["Dorsal", "Jugador", "Posición", "Min. sub."]]
+        data = [["Dorsal", "Jugador", "Posición", "Min. cambio", "Min. jugados"]]
         for r in rows:
-            data.append([str(r.get("dorsal", "") or "-"), r.get("name", ""), r.get("position", "") or "-", str(r.get("substitution_minute", "") or "-")])
-        t = Table(data, colWidths=[2*cm, 8*cm, 4*cm, 3*cm])
+            played = r.get("minutes")
+            data.append([str(r.get("dorsal", "") or "-"), r.get("name", ""), r.get("position", "") or "-",
+                         str(r.get("substitution_minute", "") or "-"),
+                         "-" if played is None or played == "" else f"{played}'"])
+        t = Table(data, colWidths=[1.7*cm, 7*cm, 3.4*cm, 2.6*cm, 2.8*cm])
         t.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#003366")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
@@ -340,7 +395,7 @@ def _build_match_sheet_pdf(sheet: dict) -> bytes:
             ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CBD5E1")),
             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8FAFC")]),
             ("ALIGN", (0, 0), (0, -1), "CENTER"),
-            ("ALIGN", (3, 0), (3, -1), "CENTER"),
+            ("ALIGN", (3, 0), (4, -1), "CENTER"),
             ("FONTSIZE", (0, 0), (-1, -1), 9),
         ]))
         story.append(t)

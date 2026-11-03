@@ -5,6 +5,7 @@ load_dotenv(ROOT_DIR / '.env')
 
 import asyncio
 import io
+import logging
 import os
 import uuid
 from datetime import datetime, timezone, timedelta, date
@@ -1612,8 +1613,17 @@ async def save_minutes(data: MinutesIn, user=Depends(require_roles("coach", "coo
     doc = data.model_dump()
     doc["id"] = str(uuid.uuid4())
     doc["coach_id"] = user["id"]
-    doc["club_id"] = require_club_context(user)
+    club_id = require_club_context(user)
+    doc["club_id"] = club_id
     doc["created_at"] = now_iso()
+    # La hoja de partido ya registra los minutos en el servidor. Si un navegador
+    # con la versión anterior manda además /minutes, no se duplica.
+    existing = await db.minutes.find_one(
+        {"club_id": club_id, "date": doc["date"], "team": doc["team"], "opponent": doc.get("opponent", "")},
+        {"_id": 0},
+    )
+    if existing and existing.get("match_sheet_id"):
+        return existing
     # low-minutes alert
     alerts = []
     for r in doc["records"]:
@@ -1631,6 +1641,8 @@ async def save_minutes(data: MinutesIn, user=Depends(require_roles("coach", "coo
                 "pct": a["pct"],
                 "match_date": doc["date"],
                 "team": doc["team"],
+                "opponent": doc.get("opponent", ""),
+                "club_id": club_id,
                 "created_at": now_iso(),
                 "read": False,
             })
@@ -1646,9 +1658,10 @@ async def list_minutes(user=Depends(get_current_user)):
 @api_router.get("/coordinator/alerts")
 async def coord_alerts(user=Depends(require_roles("coordinator", "admin"))):
     alerts = await db.coordinator_alerts.find(scoped(user), {"_id": 0}).sort("created_at", -1).to_list(200)
-    id_to_name = {p["id"]: p["name"] async for p in db.players.find({}, {"_id": 0, "id": 1, "name": 1})}
+    players = await db.players.find({"club_id": require_club_context(user)}, {"_id": 0, "id": 1, "name": 1}).to_list(5000)
+    id_to_name = {p["id"]: p["name"] for p in players}
     for a in alerts:
-        a["player_name"] = id_to_name.get(a.get("player_id"), a.get("player_id"))
+        a["player_name"] = id_to_name.get(a.get("player_id")) or a.get("player_name") or a.get("player_id")
     return alerts
 
 
@@ -1836,9 +1849,63 @@ async def player_stats(team: Optional[str] = None, category: Optional[str] = Non
             if p.get("team") in coach_allowed or p.get("category") in coach_allowed
         ]
 
-    attendance_records = await db.attendance.find(scoped(user), {"_id": 0}).to_list(2000)
-    minutes_records = await db.minutes.find(scoped(user), {"_id": 0}).to_list(2000)
+    attendance_records = await db.attendance.find(scoped(user), {"_id": 0}).to_list(5000)
+    minutes_records = await db.minutes.find(scoped(user), {"_id": 0}).to_list(5000)
     injury_records = await db.injuries.find(scoped(user), {"_id": 0}).to_list(2000)
+
+    # Las hojas de partido y de entreno son la fuente principal. Si una hoja no
+    # tiene su registro de minutos / asistencia (porque la segunda petición del
+    # navegador falló, o la hoja es anterior a este cambio), se deriva de la
+    # propia hoja para que las estadísticas no se queden a cero.
+    try:
+        from routes.sheets import _match_sheet_minutes, default_match_minutes
+        match_sheets = await db.match_sheets.find(scoped(user), {"_id": 0}).to_list(5000)
+        seen_matches = {
+            (m.get("match_sheet_id") or "") for m in minutes_records if m.get("match_sheet_id")
+        }
+        seen_keys = {
+            (str(m.get("date", "")), str(m.get("team", "")).strip().lower(), str(m.get("opponent", "")).strip().lower())
+            for m in minutes_records
+        }
+        for sh in match_sheets:
+            key = (str(sh.get("match_date", "")), str(sh.get("team", "")).strip().lower(),
+                   str(sh.get("opponent", "")).strip().lower())
+            if sh.get("id") in seen_matches or key in seen_keys:
+                continue
+            total = int(sh.get("total_match_minutes") or 0) or default_match_minutes(sh.get("category", ""))
+            rows = _match_sheet_minutes(dict(sh), total)
+            if rows:
+                minutes_records.append({
+                    "date": sh.get("match_date", ""), "team": sh.get("team", ""),
+                    "opponent": sh.get("opponent", ""), "total_match_minutes": total,
+                    "records": rows, "match_sheet_id": sh.get("id"),
+                })
+    except Exception:
+        logging.getLogger(__name__).exception("stats: no se pudieron leer las hojas de partido")
+
+    try:
+        training_sheets = await db.training_sheets.find(scoped(user), {"_id": 0}).to_list(5000)
+        seen_att = {(str(a.get("date", "")), str(a.get("team", "")).strip().lower()) for a in attendance_records}
+        roster_by_team: dict = {}
+        for p in players:
+            roster_by_team.setdefault(str(p.get("team", "")).strip().lower(), []).append(p["id"])
+        for ts in training_sheets:
+            key = (str(ts.get("date", "")), str(ts.get("team", "")).strip().lower())
+            if key in seen_att:
+                continue
+            present = {
+                r.get("player_id") for r in (ts.get("players_petos") or [])
+                if r.get("peto_color") or r.get("uniform_ok") or r.get("injured")
+            }
+            roster = roster_by_team.get(key[1], [])
+            if not roster:
+                continue
+            attendance_records.append({
+                "date": key[0], "team": ts.get("team", ""),
+                "records": [{"player_id": pid, "present": pid in present} for pid in roster],
+            })
+    except Exception:
+        logging.getLogger(__name__).exception("stats: no se pudieron leer las hojas de entreno")
 
     # Init per-player buckets
     stats = {
