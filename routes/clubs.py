@@ -164,7 +164,7 @@ async def create_team(data: TeamIn, user=Depends(require_roles("admin", "coordin
             """
         )
         sports = await _sql_rows(
-            f"select id::text as id from public.sports where slug = {_sql_literal(slug)} limit 1;"
+            f"select json_build_object('id', id::text)::text from public.sports where slug = {_sql_literal(slug)} limit 1;"
         )
     sport_id = sports[0]["id"]
     team_id = str(uuid.uuid4())
@@ -217,7 +217,7 @@ async def update_team(team_id: str, data: TeamIn, user=Depends(require_roles("ad
 
     existing = await _sql_rows(
         f"""
-        select id::text as id from public.teams
+        select json_build_object('id', id::text)::text from public.teams
         where id = {_sql_literal(team_id)}::uuid
           and club_id = {_sql_literal(club_id)}::uuid
         limit 1;

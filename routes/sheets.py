@@ -555,6 +555,347 @@ async def list_all_sheets(
     return items
 
 
+# ------------------ Control de hojas ------------------
+# Quién ha rellenado la hoja de partido (y los entrenos / convocatoria) y quién
+# no. Cruza los equipos del club con el calendario RFFM para saber qué equipos
+# jugaron y con las hojas enviadas.
+
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+    _CTRL_TZ = _ZoneInfo("Europe/Madrid")
+except Exception:  # sin tzdata
+    _CTRL_TZ = timezone.utc
+
+_LATE_DAYS = 2  # una hoja enviada más de 2 días después del partido cuenta como «tarde»
+
+
+def _today_madrid():
+    return datetime.now(_CTRL_TZ).date()
+
+
+def _iso_day(val) -> Optional[str]:
+    """Fecha en ISO (YYYY-MM-DD) desde los formatos que usan las hojas y la RFFM."""
+    if val is None:
+        return None
+    s = str(val).strip()[:10]
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _norm_team(name) -> str:
+    import unicodedata
+    import re as _re
+    s = unicodedata.normalize("NFKD", str(name or "")).encode("ascii", "ignore").decode().lower()
+    return _re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+
+def _week_bounds(desde: Optional[str], hasta: Optional[str]):
+    """Semana a revisar. Sin fechas: de lunes a miércoles se muestra la semana
+    anterior (el fin de semana que se acaba de jugar), el resto la actual."""
+    from datetime import timedelta
+    d = _iso_day(desde)
+    h = _iso_day(hasta)
+    if d and h:
+        if d > h:
+            d, h = h, d
+        return d, h
+    today = _today_madrid()
+    base = datetime.fromisoformat(d).date() if d else (today - timedelta(days=7) if today.weekday() <= 2 else today)
+    monday = base - timedelta(days=base.weekday())
+    return monday.isoformat(), (monday + timedelta(days=6)).isoformat()
+
+
+def _days_between(a: str, b: str) -> int:
+    return (datetime.fromisoformat(b).date() - datetime.fromisoformat(a).date()).days
+
+
+def _season_start() -> str:
+    from players_store import TEMPORADA
+    try:
+        year = 2000 + int(str(TEMPORADA).split("-")[0])
+    except Exception:
+        year = _today_madrid().year if _today_madrid().month >= 8 else _today_madrid().year - 1
+    return f"{year}-08-01"
+
+
+async def _club_teams(user: dict) -> list[dict]:
+    """Equipos activos de la temporada con su entrenador."""
+    from routes.clubs import list_teams
+    from players_store import TEMPORADA
+    try:
+        teams = await list_teams(temporada=TEMPORADA, include_inactive=False, user={**user, "role": "admin"})
+    except Exception:
+        teams = []
+    coaches: dict[str, list[str]] = {}
+    if hasattr(db, "fetch_json_rows"):
+        from postgres_compat import _sql_literal
+        try:
+            rows = await db.fetch_json_rows(
+                f"""
+                select json_build_object('name', coalesce(nombre, email),
+                                         'teams', coalesce(equipos_asignados, '{{}}'))::text
+                from public.profiles
+                where club_id = {_sql_literal(require_club_context(user))}::uuid and rol = 'coach';
+                """
+            )
+        except Exception:
+            rows = []
+        for r in rows:
+            for t in r.get("teams") or []:
+                coaches.setdefault(_norm_team(t), []).append(r.get("name") or "")
+    out = []
+    for t in teams:
+        name = t.get("nombre") or ""
+        names = [n for n in coaches.get(_norm_team(name), []) if n]
+        if t.get("coach_name") and t["coach_name"] not in names:
+            names.insert(0, t["coach_name"])
+        out.append({"id": t.get("id"), "team": name, "category": t.get("categoria") or "", "coaches": names})
+    return out
+
+
+def _rffm_index(team_names: list[str], rffm_matches: list[dict]) -> dict[str, list[dict]]:
+    """Asocia los partidos RFFM a los equipos del club por nombre (sin tildes ni
+    mayúsculas; si no coincide exacto, por palabras contenidas)."""
+    by_rffm: dict[str, list[dict]] = {}
+    for m in rffm_matches:
+        by_rffm.setdefault(_norm_team(m.get("team_name")), []).append(m)
+    result: dict[str, list[dict]] = {}
+    keys = list(by_rffm)
+    for name in team_names:
+        n = _norm_team(name)
+        if n in by_rffm:
+            result[name] = by_rffm[n]
+            continue
+        toks = set(n.split())
+        cands = [k for k in keys if toks and len(toks) >= 2 and (toks <= set(k.split()) or set(k.split()) <= toks)]
+        if len(cands) == 1:
+            result[name] = by_rffm[cands[0]]
+    return result
+
+
+def _pair_sheets(fixtures: list[dict], sheets: list[dict]):
+    """Empareja cada partido con su hoja (misma fecha ±1 día). Devuelve el
+    emparejamiento y las hojas que no corresponden a ningún partido RFFM
+    (amistosos, copa…)."""
+    used: set[str] = set()
+    pairs = []
+    for f in sorted(fixtures, key=lambda x: x["date"]):
+        best = None
+        for sh in sheets:
+            if sh["id"] in used or not sh.get("_day"):
+                continue
+            diff = abs(_days_between(f["date"], sh["_day"]))
+            if diff <= 1 and (best is None or diff < best[0]):
+                best = (diff, sh)
+        if best:
+            used.add(best[1]["id"])
+        pairs.append((f, best[1] if best else None))
+    extra = [sh for sh in sheets if sh["id"] not in used]
+    return pairs, extra
+
+
+def _fixture(m: dict) -> Optional[dict]:
+    day = _iso_day(m.get("match_date"))
+    if not day:
+        return None
+    return {
+        "date": day,
+        "time": m.get("match_time") or "",
+        "opponent": m.get("opponent") or "",
+        "home": bool(m.get("is_rayo_home")),
+        "jornada": m.get("jornada"),
+        "venue": m.get("official_field") or m.get("venue") or "",
+        "score": m.get("score"),
+    }
+
+
+def _sheet_status(fixture_day: str, sheet: Optional[dict], today: str) -> str:
+    if sheet:
+        created = _iso_day(sheet.get("created_at")) or sheet.get("_day")
+        if created and _days_between(fixture_day, created) > _LATE_DAYS:
+            return "tarde"
+        return "enviada"
+    if fixture_day < today:
+        return "falta"
+    if fixture_day == today:
+        return "hoy"
+    return "proxima"
+
+
+async def _load_control_data(user: dict, since: str):
+    club = require_club_context(user)
+    teams, rffm, msheets, tsheets, convs = await asyncio.gather(
+        _club_teams(user),
+        db.rffm_matches.find({"club_id": club}, {"_id": 0}).to_list(5000),
+        db.match_sheets.find({"club_id": club}, {"_id": 0}).to_list(5000),
+        db.training_sheets.find({"club_id": club}, {"_id": 0, "id": 1, "team": 1, "date": 1, "created_at": 1}).to_list(5000),
+        db.convocations.find({"club_id": club}, {"_id": 0, "id": 1, "team": 1, "match_date": 1, "opponent": 1, "created_at": 1}).to_list(5000),
+    )
+    for sh in msheets:
+        sh["_day"] = _iso_day(sh.get("match_date") or sh.get("date"))
+    for sh in tsheets:
+        sh["_day"] = _iso_day(sh.get("date"))
+    for c in convs:
+        c["_day"] = _iso_day(c.get("match_date"))
+
+    # Equipos con hojas pero que no están en el catálogo (nombres antiguos): se
+    # añaden para que no se pierdan de vista.
+    known = {_norm_team(t["team"]) for t in teams}
+    for sh in msheets + tsheets:
+        n = _norm_team(sh.get("team"))
+        if n and n not in known and (sh.get("_day") or "") >= since:
+            known.add(n)
+            teams.append({"id": None, "team": sh.get("team"), "category": sh.get("category") or "", "coaches": [sh.get("coach_name")] if sh.get("coach_name") else []})
+
+    def group(items):
+        out: dict[str, list[dict]] = {}
+        for it in items:
+            out.setdefault(_norm_team(it.get("team")), []).append(it)
+        return out
+
+    rffm_by_team = _rffm_index([t["team"] for t in teams], rffm)
+    return teams, rffm_by_team, group(msheets), group(tsheets), group(convs)
+
+
+@router.get("/sheets/control")
+async def sheets_control(
+    desde: Optional[str] = None,
+    hasta: Optional[str] = None,
+    user=Depends(require_roles("admin", "coordinator")),
+):
+    """Control semanal: por equipo, si ha enviado la hoja de partido, cuántos
+    entrenos ha registrado y si hizo convocatoria; y su cumplimiento en la temporada."""
+    d, h = _week_bounds(desde, hasta)
+    today = _today_madrid().isoformat()
+    season_from = _season_start()
+    teams, rffm_by_team, ms_by, ts_by, cv_by = await _load_control_data(user, min(d, season_from))
+
+    rows = []
+    for t in teams:
+        key = _norm_team(t["team"])
+        fixtures_all = [f for f in (_fixture(m) for m in rffm_by_team.get(t["team"], [])) if f]
+        sheets_all = [s for s in ms_by.get(key, []) if s.get("_day")]
+
+        # --- semana
+        week_fx = [f for f in fixtures_all if d <= f["date"] <= h]
+        week_sheets = [s for s in sheets_all if _days_between(d, s["_day"]) >= -1 and _days_between(s["_day"], h) >= -1]
+        pairs, extra = _pair_sheets(week_fx, week_sheets)
+        extra = [s for s in extra if d <= s["_day"] <= h]
+        convs = [c for c in cv_by.get(key, []) if c.get("_day")]
+        matches = []
+        for f, sh in pairs:
+            conv = next((c for c in convs if abs(_days_between(f["date"], c["_day"])) <= 1), None)
+            matches.append({
+                **f,
+                "status": _sheet_status(f["date"], sh, today),
+                "sheet_id": sh.get("id") if sh else None,
+                "sheet_sent_at": sh.get("created_at") if sh else None,
+                "result": (sh or {}).get("result") or None,
+                "convocation": bool(conv),
+            })
+        for sh in extra:
+            matches.append({
+                "date": sh["_day"], "time": "", "opponent": sh.get("opponent") or "",
+                "home": None, "jornada": sh.get("jornada"), "venue": "", "score": None,
+                "status": "enviada", "sheet_id": sh.get("id"), "sheet_sent_at": sh.get("created_at"),
+                "result": sh.get("result") or None, "extra": True,
+                "convocation": any(abs(_days_between(sh["_day"], c["_day"])) <= 1 for c in convs),
+            })
+        matches.sort(key=lambda m: m["date"])
+
+        trainings = sorted({s["_day"] for s in ts_by.get(key, []) if s.get("_day") and d <= s["_day"] <= h})
+        week_convs = [c for c in convs if d <= c["_day"] <= h]
+
+        statuses = [m["status"] for m in matches]
+        if "falta" in statuses:
+            status = "falta"
+        elif "hoy" in statuses or "proxima" in statuses:
+            status = "pendiente"
+        elif matches:
+            status = "ok"
+        elif fixtures_all:
+            status = "sin_partido"   # tiene calendario pero no jugó esta semana
+        else:
+            status = "sin_calendario"
+
+        # --- temporada (hasta hoy)
+        past_fx = [f for f in fixtures_all if season_from <= f["date"] < today]
+        s_pairs, _ = _pair_sheets(past_fx, [s for s in sheets_all if s["_day"] >= season_from])
+        sent = sum(1 for _, sh in s_pairs if sh)
+        late = sum(1 for f, sh in s_pairs if sh and _sheet_status(f["date"], sh, today) == "tarde")
+        missing_list = [f for f, sh in s_pairs if not sh]
+        last_match = max((s["_day"] for s in sheets_all), default=None)
+        last_training = max((s["_day"] for s in ts_by.get(key, []) if s.get("_day")), default=None)
+
+        rows.append({
+            "team": t["team"],
+            "team_id": t.get("id"),
+            "category": t.get("category") or "",
+            "coaches": t.get("coaches") or [],
+            "rffm_linked": bool(fixtures_all),
+            "status": status,
+            "matches": matches,
+            "trainings": len(trainings),
+            "training_dates": trainings,
+            "convocations": len(week_convs),
+            "last_match_sheet": last_match,
+            "last_training_sheet": last_training,
+            "season": {
+                "expected": len(past_fx),
+                "sent": sent,
+                "late": late,
+                "missing": len(missing_list),
+                "pct": round(100 * sent / len(past_fx)) if past_fx else None,
+            },
+        })
+
+    order = {"falta": 0, "pendiente": 1, "sin_calendario": 2, "sin_partido": 3, "ok": 4}
+    rows.sort(key=lambda r: (order.get(r["status"], 9), r["team"].lower()))
+    summary = {k: sum(1 for r in rows if r["status"] == k) for k in order}
+    summary["teams"] = len(rows)
+    summary["missing_sheets"] = sum(1 for r in rows for m in r["matches"] if m["status"] == "falta")
+    summary["without_training"] = sum(1 for r in rows if r["trainings"] == 0)
+    return {"desde": d, "hasta": h, "today": today, "season_from": season_from, "summary": summary, "teams": rows}
+
+
+@router.get("/sheets/mis-pendientes")
+async def my_pending_sheets(user=Depends(get_current_user)):
+    """Para el entrenador: partidos ya jugados (últimas 3 semanas) de sus equipos
+    sin hoja de partido. Se usa para el aviso del panel."""
+    from datetime import timedelta
+    allowed = [str(t).strip("{} ") for t in (user.get("assigned_teams") or []) if str(t).strip("{} ")]
+    if user.get("role") != "coach" or not allowed:
+        return []
+    club = require_club_context(user)
+    today = _today_madrid()
+    since = (today - timedelta(days=21)).isoformat()
+    rffm, msheets = await asyncio.gather(
+        db.rffm_matches.find({"club_id": club}, {"_id": 0}).to_list(5000),
+        db.match_sheets.find({"club_id": club}, {"_id": 0, "id": 1, "team": 1, "match_date": 1, "date": 1}).to_list(5000),
+    )
+    idx = _rffm_index(allowed, rffm)
+    out = []
+    for team in allowed:
+        fx = [f for f in (_fixture(m) for m in idx.get(team, [])) if f and since <= f["date"] < today.isoformat()]
+        sheets = []
+        for s in msheets:
+            if _norm_team(s.get("team")) == _norm_team(team):
+                s["_day"] = _iso_day(s.get("match_date") or s.get("date"))
+                sheets.append(s)
+        pairs, _ = _pair_sheets(fx, sheets)
+        for f, sh in pairs:
+            if not sh:
+                out.append({**f, "team": team, "days_late": _days_between(f["date"], today.isoformat())})
+    out.sort(key=lambda m: m["date"])
+    return out
+
+
 # ------------------ Convocations ------------------
 def build_convocation_text(data, names: list[str]) -> str:
     """Texto de la convocatoria listo para pegar en WhatsApp."""
