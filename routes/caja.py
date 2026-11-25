@@ -79,6 +79,63 @@ DEFAULT_CONFIG = {
 }
 
 
+RAYO_SLUG = "rayo-majadahonda"
+
+
+def _generic_config(club_name: str) -> dict:
+    """Caja inicial para cualquier club que no sea el Rayo: una sola entidad
+    (el propio club) y conceptos típicos. Todo se cambia desde Ajustes."""
+    return {
+        "conceptos": [
+            {"key": "cuota", "nombre": "Cuota", "entidad": "Club", "iva": None, "pide_nombre": True, "precio": None, "color": "violet"},
+            {"key": "matricula", "nombre": "Matrícula", "entidad": "Club", "iva": None, "pide_nombre": True, "precio": None, "color": "violet"},
+            {"key": "equipacion", "nombre": "Equipación", "entidad": "Club", "iva": None, "pide_nombre": True, "precio": None,
+             "color": "blue", "stock": True, "opciones": []},
+            {"key": "merchandising", "nombre": "Merchandising", "entidad": "Club", "iva": None, "pide_nombre": False, "precio": None, "color": "amber", "stock": True},
+            {"key": "campus", "nombre": "Campus y torneos", "entidad": "Club", "iva": None, "pide_nombre": True, "precio": None, "color": "green"},
+            {"key": "taquilla", "nombre": "Taquilla", "entidad": "Club", "iva": None, "pide_nombre": False, "precio": None, "color": "navy"},
+            {"key": "otro", "nombre": "Otro", "entidad": None, "iva": None, "pide_nombre": True, "precio": None, "color": "slate", "libre": True},
+        ],
+        "entidades": {
+            "Club": {"nombre": club_name or "Club", "cif": "", "direccion": "", "serie": "REC", "exenta_iva": False},
+        },
+        "recibo": {"papel": "80", "copias": 2, "pie": "Gracias por confiar en el club."},
+        "motivos_salida": list(DEFAULT_CONFIG["motivos_salida"]),
+    }
+
+
+def _base_config(club: Optional[dict]) -> dict:
+    """El Rayo (y los clubes que no constan en public.clubs) parten de su
+    configuración; el resto, de una genérica con el nombre del club."""
+    import copy
+    if not club or club.get("slug") == RAYO_SLUG:
+        return copy.deepcopy(DEFAULT_CONFIG)
+    return _generic_config(club.get("nombre") or "")
+
+
+_CLUB_SQL = "select json_build_object('slug', slug, 'nombre', nombre) from public.clubs where id::text = %s"
+
+
+def _club_sync(cur, club_id: str) -> Optional[dict]:
+    try:
+        cur.execute("savepoint caja_club")
+        cur.execute(_CLUB_SQL, (club_id,))
+        row = cur.fetchone()
+        cur.execute("release savepoint caja_club")
+        return row[0] if row else None
+    except Exception:
+        cur.execute("rollback to savepoint caja_club")
+        return None
+
+
+async def _club(club_id: str) -> Optional[dict]:
+    try:
+        rows = await _read(_CLUB_SQL, (club_id,))
+    except Exception:
+        return None
+    return rows[0] if rows else None
+
+
 def _slug(s: str) -> str:
     s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
     return re.sub(r"[^a-z0-9]+", "_", s).strip("_")[:40] or "concepto"
@@ -153,12 +210,12 @@ def _select(cur, collection: str, club_id: str, where: str = "", params: tuple =
 def _config_sync(cur, club_id: str) -> dict:
     rows = _select(cur, "caja_config", club_id)
     cfg = rows[0] if rows else None
-    return _merge_config(cfg)
+    return _merge_config(cfg, _base_config(_club_sync(cur, club_id)) if not cfg else None)
 
 
-def _merge_config(cfg: Optional[dict]) -> dict:
+def _merge_config(cfg: Optional[dict], base: Optional[dict] = None) -> dict:
     import copy
-    out = copy.deepcopy(DEFAULT_CONFIG)
+    out = base if base is not None else copy.deepcopy(DEFAULT_CONFIG)
     if cfg:
         for k in ("conceptos", "entidades", "recibo", "motivos_salida"):
             if cfg.get(k):
@@ -169,7 +226,9 @@ def _merge_config(cfg: Optional[dict]) -> dict:
 async def _config(club_id: str) -> dict:
     rows = await _read("select doc from public.app_documents where collection = %s and doc->>'club_id' = %s",
                        ("caja_config", club_id))
-    return _merge_config(rows[0] if rows else None)
+    if rows:
+        return _merge_config(rows[0])
+    return _base_config(await _club(club_id))
 
 
 # ------------------------------------------------------------------ cálculos
@@ -495,7 +554,7 @@ async def create_movimiento(data: MovimientoIn, user=Depends(require_roles(*CAJA
             if entidad and entidad not in cfg["entidades"]:
                 raise HTTPException(status_code=400, detail="Entidad no válida")
             if not entidad:
-                raise HTTPException(status_code=400, detail="Elige si es SAD o Fundación")
+                raise HTTPException(status_code=400, detail="Elige la entidad que cobra")
             concepto_nombre = c["nombre"] + (f" · {data.opcion}" if data.opcion else "") \
                 + (f" · {data.descripcion.strip()}" if c.get("libre") and data.descripcion.strip() else "")
             iva = _iva_for(cfg, c["key"], entidad)

@@ -2360,6 +2360,7 @@ from routes import clubs as _clubs_routes  # noqa: E402
 from routes import users as _users_routes  # noqa: E402
 from routes import stock as _stock_routes  # noqa: E402
 from routes import caja as _caja_routes  # noqa: E402
+from routes import billing as _billing_routes  # noqa: E402
 # Chat interno retirado (Klink lo sustituirá): sin filtro de club, no se monta.
 # api_router.include_router(_chat_routes.router)
 api_router.include_router(_sheets_routes.router)
@@ -2370,6 +2371,7 @@ api_router.include_router(_clubs_routes.router)
 api_router.include_router(_users_routes.router)
 api_router.include_router(_stock_routes.router)
 api_router.include_router(_caja_routes.router)
+api_router.include_router(_billing_routes.router)
 
 
 
@@ -3014,7 +3016,8 @@ async def _shutdown():
         pass
 
 
-app.include_router(api_router, prefix="/api")
+# billing_guard: modo solo lectura, módulos por plan y límites (solo con BILLING_ENFORCE=1).
+app.include_router(api_router, prefix="/api", dependencies=[Depends(_billing_routes.billing_guard)])
 
 # CORS: explicit origins required when allow_credentials=True.
 # Browsers drop credentials if allow_origins contains "*".

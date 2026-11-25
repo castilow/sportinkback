@@ -125,7 +125,8 @@ class PublicRegistrationIn(BaseModel):
     admin: AdminRegistrationIn
     club: ClubRegistrationIn
     sport: SportRegistrationIn = Field(default_factory=SportRegistrationIn)
-    teams: List[TeamRegistrationIn] = Field(..., min_length=1, max_length=MAX_TEAMS)
+    # Opcional: el club puede crear o importar sus equipos después del alta.
+    teams: List[TeamRegistrationIn] = Field(default_factory=list, max_length=MAX_TEAMS)
     players: List[PlayerRegistrationIn] = Field(default_factory=list, max_length=MAX_PLAYERS)
 
     @field_validator("teams")
