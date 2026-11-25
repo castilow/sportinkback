@@ -2359,6 +2359,7 @@ from routes import registration as _registration_routes  # noqa: E402
 from routes import clubs as _clubs_routes  # noqa: E402
 from routes import users as _users_routes  # noqa: E402
 from routes import stock as _stock_routes  # noqa: E402
+from routes import caja as _caja_routes  # noqa: E402
 # Chat interno retirado (Klink lo sustituirá): sin filtro de club, no se monta.
 # api_router.include_router(_chat_routes.router)
 api_router.include_router(_sheets_routes.router)
@@ -2368,6 +2369,7 @@ api_router.include_router(_registration_routes.router)
 api_router.include_router(_clubs_routes.router)
 api_router.include_router(_users_routes.router)
 api_router.include_router(_stock_routes.router)
+api_router.include_router(_caja_routes.router)
 
 
 
