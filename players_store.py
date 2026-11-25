@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import uuid
 from datetime import date
 from typing import Any, Optional
 
 from postgres_compat import AsyncCursor, DeleteResult, InsertOneResult, UpdateResult, _sql_literal
+
+logger = logging.getLogger(__name__)
 
 TEMPORADA = os.environ.get("APP_SEASON", "26-27").strip() or "26-27"
 _use_sql: Optional[bool] = None
@@ -189,7 +192,29 @@ async def _fetch_sql_rows(db: Any, sql: str) -> list[dict]:
     return data if isinstance(data, list) else []
 
 
-async def fetch_all_sql_players(db: Any, club_id: Optional[str] = None) -> list[dict]:
+async def fetch_all_sql_players(
+    db: Any,
+    club_id: Optional[str] = None,
+    allow_all_clubs: bool = False,
+) -> list[dict]:
+    """Jugadores de UN club.
+
+    (2026-11-25) Sin club_id esto devolvía los jugadores de TODOS los clubes.
+    Mientras solo hubo uno no se notaba; con varios, un solo sitio que se
+    olvide de filtrar enseña el padrón ajeno entero. Ahora, sin club, no hay
+    jugadores: un olvido se convierte en "no veo nada" en vez de en "lo veo
+    todo", que es el lado correcto por el que fallar.
+
+    Para un recuento global de verdad (un script, un informe de la
+    plataforma), hay que pedirlo a propósito con allow_all_clubs=True.
+    """
+    if not club_id and not allow_all_clubs:
+        logger.warning(
+            "fetch_all_sql_players sin club_id: se devuelven 0 jugadores. "
+            "Si hacía falta el global, pásalo con allow_all_clubs=True."
+        )
+        return []
+
     sql = PLAYERS_SELECT_SQL.format(temporada=_sql_literal(TEMPORADA))
     if club_id:
         import uuid as _uuid
@@ -395,8 +420,9 @@ class PlayersStore:
     def __init__(self, db: Any, fallback_collection: Any):
         self._db = db
         self._fallback = fallback_collection
-        # Caché por club: None = todos los clubes (consultas sin club_id).
-        # Así el club A no recarga sus jugadores cuando el club B escribe.
+        # Caché por club, para que el club A no recargue sus jugadores
+        # cuando el club B escribe. La clave None ya no quiere decir "todos
+        # los clubes": desde 2026-11-25 una consulta sin club devuelve vacío.
         self._cache: dict[Optional[str], list[dict]] = {}
 
     async def _load(self, club_id: Optional[str] = None) -> list[dict]:

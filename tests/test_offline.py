@@ -76,3 +76,41 @@ def test_players_cache_is_per_club_and_invalidation_is_targeted():
         assert calls[-1] == "A"
     finally:
         players_store.fetch_all_sql_players = original
+
+
+# ── Aislamiento entre clubes (2026-11-25) ──────────────────────────────────
+#
+# Estos dos cubren la fuga por la que un club recién registrado veía el
+# padrón del Rayo. isolation_check.py no podía cazarla: compara dos clubes
+# BIEN configurados, y el fallo vivía justo en el estado que no reproduce —
+# una cuenta nueva, todavía sin club.
+
+
+def test_sin_club_no_hay_jugadores():
+    """Una consulta que se olvide del club devuelve 0, no el padrón entero."""
+    assert asyncio.run(players_store.fetch_all_sql_players(None)) == []
+    assert asyncio.run(players_store.fetch_all_sql_players(None, club_id=None)) == []
+
+
+def test_club_por_defecto_no_esta_cableado_a_un_club():
+    """Ningún club concreto puede estar escrito a mano en la resolución de club.
+
+    Aquí hubo un `slug = 'rayo-majadahonda'` que convertía "este usuario no
+    tiene club" en "este usuario es del Rayo". Si alguien lo vuelve a meter,
+    que salte aquí y no en el panel de un cliente.
+    """
+    ruta = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "deps.py")
+    with open(ruta, encoding="utf-8") as fh:
+        codigo = fh.read()
+    vivo = "\n".join(l for l in codigo.splitlines() if not l.lstrip().startswith("#"))
+
+    # La consulta del club por defecto no puede seleccionar un club concreto.
+    inicio = vivo.find("async def _fetch_default_club_id")
+    assert inicio != -1, "falta _fetch_default_club_id"
+    cuerpo = vivo[inicio:inicio + 1200]
+    assert "slug =" not in cuerpo and "slug=" not in cuerpo, (
+        "hay un club elegido por slug en la resolución del club por defecto"
+    )
+
+    # Y ese club no se asigna solo: hace falta encender el interruptor a mano.
+    assert "SPORTINK_CLUB_FALLBACK" in vivo, "el fallback de club debe estar tras un interruptor"

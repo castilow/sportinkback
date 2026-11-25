@@ -576,11 +576,42 @@ async def resolve_app_user_from_token(access_token: str) -> dict:
     user.setdefault("club_id", None)
     user.setdefault("assigned_teams", user.get("assigned_teams") or [])
 
+    # (2026-11-25) FUGA DE DATOS ENTRE CLUBES — corregido.
+    #
+    # Aquí, a un usuario de staff SIN club se le asignaba el "club por
+    # defecto", que la consulta de abajo resolvía como el Rayo Majadahonda.
+    # Consecuencia: cualquiera que creara una cuenta nueva entraba y veía el
+    # padrón completo del Rayo —994 jugadores, con sus cuotas y sus seguros,
+    # la mayoría menores— creyendo que era su propio club. Y como además se
+    # marcaba onboarding_completed=True, ni siquiera le aparecía el paso de
+    # crear el suyo.
+    #
+    # "Este usuario no tiene club" NO puede significar "este usuario es del
+    # Rayo". Sin club, se va al onboarding: es lo que ya hace
+    # require_club_context devolviendo 403.
+    #
+    # La muleta solo existe para no dejar tirado al staff real del Rayo
+    # mientras se corrige su vínculo en la base de datos, y está APAGADA por
+    # defecto. Para encenderla un rato:
+    #   SPORTINK_CLUB_FALLBACK=1
+    # Cada uso deja un aviso en el log, a propósito: no es un modo de
+    # funcionamiento, es una tirita con fecha de caducidad.
     if not user.get("club_id") and user.get("role") in ("admin", "coordinator", "coach", "office", "physio"):
-        default_club = await _fetch_default_club_id()
-        if default_club:
-            user["club_id"] = default_club
-            user["onboarding_completed"] = True
+        if os.getenv("SPORTINK_CLUB_FALLBACK", "").strip() in ("1", "true", "yes"):
+            default_club = await _fetch_default_club_id()
+            if default_club:
+                logger.warning(
+                    "SPORTINK_CLUB_FALLBACK activo: a %s (rol %s) se le asigna el club "
+                    "por defecto %s. Vincula su club de verdad y apaga el interruptor.",
+                    user.get("email") or user.get("id"), user.get("role"), default_club,
+                )
+                user["club_id"] = default_club
+                user["onboarding_completed"] = True
+        else:
+            logger.info(
+                "Usuario %s (rol %s) sin club asignado: va al onboarding.",
+                user.get("email") or user.get("id"), user.get("role"),
+            )
 
     user.setdefault("onboarding_completed", bool(user.get("club_id")))
     _user_cache_set(access_token, user)
@@ -601,8 +632,7 @@ async def _fetch_default_club_id() -> Optional[str]:
             """
             select json_build_object('id', id::text)::text
             from public.clubs
-            where is_default = true or slug = 'rayo-majadahonda'
-            order by is_default desc
+            where is_default = true
             limit 1;
             """
         )
