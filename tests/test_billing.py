@@ -482,3 +482,54 @@ def test_duenos_de_plataforma_desde_la_tabla(env, monkeypatch):
     finally:
         sql(env, "delete from public.platform_admins where email = 'dir@prueba.test'")
         billing._PLATFORM_CACHE.update(t=0.0, emails=set())
+
+
+def test_eliminar_club_borra_todo_y_protege_el_principal(env, monkeypatch):
+    monkeypatch.setenv("PLATFORM_ADMIN_EMAILS", "dir@prueba.test")
+    import deps as _deps
+    borradas = []
+    monkeypatch.setattr(_deps, "delete_supabase_auth_user", lambda aid: borradas.append(aid))
+    other = str(uuid.uuid4()); uid = str(uuid.uuid4())
+    with psycopg.connect(env.dsn) as conn:
+        conn.execute("insert into public.clubs (id, slug, nombre) values (%s, %s, 'CD Para Borrar')", (other, "b-" + other[:8]))
+        sport = conn.execute("select id from public.sports limit 1").fetchone()[0]
+        conn.execute("insert into public.teams (club_id, sport_id, nombre, categoria, temporada, activo) values (%s, %s, 'Alevín A', 'Alevín', '26-27', true)", (other, sport))
+        conn.execute("insert into public.app_documents (collection, doc) values ('match_sheets', %s)", (json.dumps({"id": "x", "club_id": other}),))
+        conn.execute("insert into auth.users (id, email) values (%s, %s)", (uid, f"u-{uid[:6]}@borrar.test"))
+        conn.execute("insert into public.profiles (id, email, nombre, rol, club_id) values (%s, %s, 'U', 'admin', %s)", (uid, f"u-{uid[:6]}@borrar.test", other))
+    prev = call(env, "GET", f"/api/billing/admin/clubs/{other}/borrado").json()
+    assert prev["equipos"] == 1 and prev["usuarios"] == 1 and prev["registros"] == 1
+    r = call(env, "DELETE", f"/api/billing/admin/clubs/{other}", json={"confirmacion": "otro nombre"})
+    assert r.status_code == 400
+    r = call(env, "DELETE", f"/api/billing/admin/clubs/{other}", json={"confirmacion": "cd para borrar"})
+    assert r.status_code == 200 and r.json()["equipos"] == 1 and borradas == [uid]
+    assert sql(env, "select count(*) from public.clubs where id = %s", other) == [(0,)]
+    assert sql(env, "select count(*) from public.app_documents where doc->>'club_id' = %s", other) == [(0,)]
+    assert sql(env, "select count(*) from public.profiles where id = %s", uid) == [(0,)]
+    sql(env, "delete from auth.users where id = %s", uid)
+    rayo = sql(env, "select id::text, nombre from public.clubs where is_default")[0]
+    r = call(env, "DELETE", f"/api/billing/admin/clubs/{rayo[0]}", json={"confirmacion": rayo[1]})
+    assert r.status_code == 409
+
+
+def test_invitar_y_quitar_administradores(env, monkeypatch):
+    monkeypatch.setenv("PLATFORM_ADMIN_EMAILS", "dir@prueba.test")
+    monkeypatch.setattr(billing, "_invite_auth_user_sync", lambda email, nombre, redirect: "invitado")
+    r = call(env, "POST", "/api/billing/admin/admins", json={"email": "Socia@Sportink.test", "nombre": "Socia"})
+    assert r.status_code == 200 and r.json() == {"email": "socia@sportink.test", "estado": "invitado"}
+    lista = call(env, "GET", "/api/billing/admin/admins").json()
+    assert {"socia@sportink.test", "dir@prueba.test"} <= {a["email"] for a in lista}
+    assert [a for a in lista if a["email"] == "dir@prueba.test"][0]["tu"] is True
+    assert call(env, "DELETE", "/api/billing/admin/admins/dir@prueba.test").status_code == 409   # a ti mismo no
+    assert call(env, "DELETE", "/api/billing/admin/admins/socia@sportink.test").status_code == 200
+    assert call(env, "POST", "/api/billing/admin/admins", json={"email": "no-es-correo"}).status_code == 400
+
+
+
+def test_el_correo_del_equipo_sportink_no_sale_como_direccion(env, monkeypatch, mail):
+    # `mail` crea un perfil de Dirección (dir-xxx@club.test) en el club de prueba
+    me = sql(env, "select email from public.profiles where club_id = %s", env.club)[0][0]
+    monkeypatch.setenv("PLATFORM_ADMIN_EMAILS", f"dir@prueba.test,{me}")
+    d = call(env, "GET", "/api/billing/admin/clubs").json()
+    mine = [c for c in d["clubes"] if c["club_id"] == env.club][0]
+    assert me not in mine["admins"] and mine["admins"] == ""

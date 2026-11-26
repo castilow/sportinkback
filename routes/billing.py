@@ -1127,7 +1127,7 @@ def _admin_row(r: dict, prices: dict, now: datetime) -> dict:
         test = _env("STRIPE_SECRET_KEY").startswith("sk_test")
         stripe_url = f"https://dashboard.stripe.com/{'test/' if test else ''}customers/{r['stripe_customer_id']}"
     return {
-        "club_id": r["club_id"], "nombre": r["nombre"], "slug": r["slug"],
+        "club_id": r["club_id"], "nombre": r["nombre"], "slug": r["slug"], "por_defecto": bool(r.get("por_defecto")),
         "alta": _iso(r.get("club_creado")), "admins": r.get("admins") or "",
         "estado": estado, "estado_stripe": r.get("status"),
         "plan": r.get("plan"), "plan_nombre": PLANS.get(r.get("plan") or "", {}).get("nombre"),
@@ -1145,7 +1145,12 @@ def _admin_row(r: dict, prices: dict, now: datetime) -> dict:
 @router.get("/billing/admin/clubs")
 async def admin_list_clubs(user=Depends(require_platform_admin)):
     """Panel de Sportink: todos los clubes, su estado, lo que pagan y los resúmenes."""
-    rows, prices = await asyncio.gather(_io(_admin_clubs_sync), _io(_prices_sync))
+    rows, prices, platform = await asyncio.gather(_io(_admin_clubs_sync), _io(_prices_sync), _io(_platform_emails_db_sync))
+    platform = set(platform) | {e.strip().lower() for e in _env("PLATFORM_ADMIN_EMAILS").split(",") if e.strip()}
+    for r in rows:
+        # Las cuentas del equipo Sportink no son «la Dirección» de ningún club.
+        emails = [e.strip() for e in (r.get("admins") or "").split(",") if e.strip()]
+        r["admins"] = ", ".join(e for e in emails if e.lower() not in platform)
     now = _now()
     clubs = [_admin_row(r, prices, now) for r in rows]
     by = lambda e: [c for c in clubs if c["estado"] == e]  # noqa: E731
@@ -1190,3 +1195,189 @@ async def admin_update_club(club_id: str, data: AdminClubIn, user=Depends(requir
     _invalidate(club_id)
     logger.info("Plataforma: %s cambia la suscripción del club %s: %s", user.get("email"), club_id, list(changes))
     return _sub_out(row, compute_access(row))
+
+
+
+# ------------------------------------------------------------------ plataforma: eliminar clubes
+class DeleteClubIn(BaseModel):
+    confirmacion: str = Field(..., min_length=1, max_length=200)
+
+
+def _delete_club_sync(club_id: str, keep_emails: set[str]) -> dict:
+    """Borra el club y TODOS sus datos en una transacción. Devuelve los usuarios a borrar de Auth."""
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute("select nombre, is_default from public.clubs where id = %s::uuid for update", (club_id,))
+        club = cur.fetchone()
+        if not club:
+            raise HTTPException(status_code=404, detail="Club no encontrado")
+        cur.execute("select id::text, lower(coalesce(email, '')) from public.profiles where club_id = %s::uuid", (club_id,))
+        profiles = cur.fetchall()
+        cur.execute("delete from public.app_documents where doc->>'club_id' = %s", (club_id,))
+        docs = cur.rowcount
+        cur.execute("delete from public.players where club_id = %s::uuid", (club_id,))
+        players = cur.rowcount
+        cur.execute("select count(*) from public.teams where club_id = %s::uuid", (club_id,))
+        teams = cur.fetchone()[0]
+        to_delete_auth = []
+        for pid, email in profiles:
+            if email and email in keep_emails:
+                cur.execute("update public.profiles set club_id = null where id = %s::uuid", (pid,))
+            else:
+                cur.execute("delete from public.profiles where id = %s::uuid", (pid,))
+                to_delete_auth.append(pid)
+        # equipos, deportes, cuotas y suscripción caen en cascada
+        cur.execute("delete from public.clubs where id = %s::uuid", (club_id,))
+    return {"nombre": club[0], "jugadores": players, "equipos": int(teams), "documentos": docs,
+            "usuarios": len(profiles), "auth_ids": to_delete_auth}
+
+
+@router.get("/billing/admin/clubs/{club_id}/borrado")
+async def admin_delete_preview(club_id: str, user=Depends(require_platform_admin)):
+    """Qué se borraría (para el diálogo de confirmación)."""
+    from players_store import TEMPORADA  # noqa: F401
+
+    def run():
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute("select nombre, is_default from public.clubs where id = %s::uuid", (club_id,))
+            club = cur.fetchone()
+            if not club:
+                raise HTTPException(status_code=404, detail="Club no encontrado")
+            cur.execute("select count(*) from public.players where club_id = %s::uuid", (club_id,))
+            players = cur.fetchone()[0]
+            cur.execute("select count(*) from public.teams where club_id = %s::uuid", (club_id,))
+            teams = cur.fetchone()[0]
+            cur.execute("select count(*) from public.profiles where club_id = %s::uuid", (club_id,))
+            users = cur.fetchone()[0]
+            cur.execute("select count(*) from public.app_documents where doc->>'club_id' = %s", (club_id,))
+            docs = cur.fetchone()[0]
+            return {"nombre": club[0], "por_defecto": bool(club[1]), "jugadores": players, "equipos": teams,
+                    "usuarios": users, "registros": docs}
+    return await _io(run)
+
+
+@router.delete("/billing/admin/clubs/{club_id}")
+async def admin_delete_club(club_id: str, data: DeleteClubIn, user=Depends(require_platform_admin)):
+    """Elimina un club con TODOS sus datos (jugadores, equipos, hojas, caja, usuarios…).
+    No se puede deshacer. Pide escribir el nombre del club. El club por defecto no se puede borrar."""
+    info = await admin_delete_preview(club_id, user)
+    if info["por_defecto"]:
+        raise HTTPException(status_code=409, detail="El club principal de la plataforma no se puede eliminar.")
+    if data.confirmacion.strip().lower() != (info["nombre"] or "").strip().lower():
+        raise HTTPException(status_code=400, detail="El nombre escrito no coincide con el del club.")
+    sub = None
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute(_SELECT + " where club_id = %s::uuid", (club_id,))
+            sub = _row(cur)
+    except Exception:
+        sub = None
+    if sub and sub.get("stripe_subscription_id") and sub.get("status") in FULL_STATUSES and not sub.get("comped"):
+        if not _env("STRIPE_SECRET_KEY"):
+            raise HTTPException(status_code=409, detail="El club tiene una suscripción activa en Stripe. Cancélala primero.")
+        try:
+            await _io(lambda: _client().v1.subscriptions.cancel(sub["stripe_subscription_id"]))
+        except stripe.StripeError as exc:
+            logger.error("No se pudo cancelar la suscripción de %s antes de borrar: %s", club_id, exc)
+            raise HTTPException(status_code=502, detail="No se pudo cancelar la suscripción en Stripe; no se ha borrado nada.")
+
+    keep = set(await _io(_platform_emails_db_sync)) | {
+        e.strip().lower() for e in _env("PLATFORM_ADMIN_EMAILS").split(",") if e.strip()}
+    result = await _io(_delete_club_sync, club_id, keep)
+    _invalidate(club_id)
+
+    # Cuentas de acceso de ese club (fuera de la transacción: es otra API).
+    from deps import delete_supabase_auth_user, invalidate_user_cache
+    failed = 0
+    for auth_id in result.pop("auth_ids"):
+        try:
+            await _io(delete_supabase_auth_user, auth_id)
+        except Exception as exc:
+            failed += 1
+            logger.warning("No se pudo borrar la cuenta %s del club eliminado: %s", auth_id, exc)
+    invalidate_user_cache()
+    logger.warning("Plataforma: %s ELIMINA el club %s (%s): %s", user.get("email"), club_id, result["nombre"], result)
+    return {**result, "cuentas_no_borradas": failed}
+
+
+# ------------------------------------------------------------------ plataforma: administradores
+class PlatformAdminIn(BaseModel):
+    email: str = Field(..., min_length=3, max_length=200)
+    nombre: Optional[str] = Field(default=None, max_length=120)
+
+
+def _list_platform_admins_sync() -> list[dict]:
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute("select email, nombre, created_at from public.platform_admins order by created_at")
+        return [{"email": e, "nombre": n or "", "alta": _iso(c), "origen": "tabla"} for e, n, c in cur.fetchall()]
+
+
+@router.get("/billing/admin/admins")
+async def admin_list_admins(user=Depends(require_platform_admin)):
+    rows = await _io(_list_platform_admins_sync)
+    seen = {r["email"] for r in rows}
+    for e in [e.strip().lower() for e in _env("PLATFORM_ADMIN_EMAILS").split(",") if e.strip()]:
+        if e not in seen:
+            rows.append({"email": e, "nombre": "", "alta": None, "origen": "render"})
+    me = (user.get("email") or "").lower()
+    for r in rows:
+        r["tu"] = r["email"] == me
+    return rows
+
+
+def _invite_auth_user_sync(email: str, nombre: str, redirect: Optional[str]) -> str:
+    """Si el correo no tiene cuenta, Supabase le manda una invitación para crear su contraseña."""
+    from deps import supabase_admin_find_user_by_email, _supabase_admin_request, _supabase_error_message
+    if supabase_admin_find_user_by_email(email):
+        return "ya_tenia_cuenta"
+    path = "/auth/v1/invite"
+    if redirect:
+        from urllib.parse import quote
+        path += f"?redirect_to={quote(redirect, safe='')}"
+    resp = _supabase_admin_request("POST", path, json={"email": email, "data": {"name": nombre or email}},
+                                   headers={"Content-Type": "application/json"})
+    if resp.status_code >= 300:
+        raise RuntimeError(_supabase_error_message(resp))
+    return "invitado"
+
+
+@router.post("/billing/admin/admins")
+async def admin_add_admin(data: PlatformAdminIn, request: Request, user=Depends(require_platform_admin)):
+    import re as _re
+    email = data.email.strip().lower()
+    if not _re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        raise HTTPException(status_code=400, detail="Correo no válido")
+
+    def insert():
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute("insert into public.platform_admins (email, nombre) values (%s, %s) on conflict (email) do update "
+                        "set nombre = coalesce(excluded.nombre, public.platform_admins.nombre)", (email, data.nombre))
+    await _io(insert)
+    _PLATFORM_CACHE.update(t=0.0, emails=set())
+    try:
+        base = _frontend_base(request)
+    except HTTPException:
+        base = ""
+    try:
+        estado = await _io(_invite_auth_user_sync, email, data.nombre or "", f"{base}/restablecer" if base else None)
+    except Exception as exc:
+        logger.warning("Invitación de %s: no se pudo enviar el correo: %s", email, exc)
+        estado = "sin_correo"
+    logger.warning("Plataforma: %s añade como administrador a %s (%s)", user.get("email"), email, estado)
+    return {"email": email, "estado": estado}
+
+
+@router.delete("/billing/admin/admins/{email}")
+async def admin_remove_admin(email: str, user=Depends(require_platform_admin)):
+    email = email.strip().lower()
+    if email == (user.get("email") or "").lower():
+        raise HTTPException(status_code=409, detail="No puedes quitarte a ti mismo.")
+
+    def run():
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute("delete from public.platform_admins where email = %s", (email,))
+            return cur.rowcount
+    if not await _io(run):
+        raise HTTPException(status_code=404, detail="Ese correo no está en la lista (o viene de Render).")
+    _PLATFORM_CACHE.update(t=0.0, emails=set())
+    logger.warning("Plataforma: %s quita como administrador a %s", user.get("email"), email)
+    return {"ok": True}

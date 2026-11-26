@@ -649,7 +649,13 @@ async def logout(request: Request, response: Response):
 
 @api_router.get("/auth/me")
 async def me(user: dict = Depends(get_current_user)):
-    return user
+    # platform_admin: dueños de Sportink (entran directos al Panel de Sportink).
+    from routes import billing as _billing
+    try:
+        platform = await _billing.is_platform_admin(user)
+    except Exception:
+        platform = False
+    return {**user, "platform_admin": platform}
 
 
 class ChangePasswordIn(BaseModel):
