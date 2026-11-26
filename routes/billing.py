@@ -1024,13 +1024,36 @@ async def billing_cron(request: Request):
 
 
 # ------------------------------------------------------------------ plataforma (dueños de Sportink)
-def _is_platform_admin(user: dict) -> bool:
-    emails = {e.strip().lower() for e in _env("PLATFORM_ADMIN_EMAILS").split(",") if e.strip()}
-    return bool(emails) and (user.get("email") or "").lower() in emails
+_PLATFORM_CACHE: dict = {"t": 0.0, "emails": set()}
+
+
+def _platform_emails_db_sync() -> set[str]:
+    """Correos de public.platform_admins (caché de 60 s)."""
+    if time.monotonic() - _PLATFORM_CACHE["t"] < 60:
+        return _PLATFORM_CACHE["emails"]
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute("select lower(email) from public.platform_admins")
+            emails = {r[0] for r in cur.fetchall()}
+    except Exception as exc:  # tabla aún sin crear: solo cuenta la variable de entorno
+        logger.info("platform_admins no disponible: %s", exc)
+        emails = set()
+    _PLATFORM_CACHE.update(t=time.monotonic(), emails=emails)
+    return emails
+
+
+async def is_platform_admin(user: dict) -> bool:
+    email = (user.get("email") or "").strip().lower()
+    if not email:
+        return False
+    env_emails = {e.strip().lower() for e in _env("PLATFORM_ADMIN_EMAILS").split(",") if e.strip()}
+    if email in env_emails:
+        return True
+    return email in await _io(_platform_emails_db_sync)
 
 
 async def require_platform_admin(user=Depends(get_current_user)):
-    if not _is_platform_admin(user):
+    if not await is_platform_admin(user):
         raise HTTPException(status_code=404, detail="Not Found")
     return user
 
@@ -1042,16 +1065,106 @@ class AdminClubIn(BaseModel):
     notes: Optional[str] = Field(default=None, max_length=300)
 
 
+@router.get("/billing/admin/me")
+async def admin_me(user=Depends(get_current_user)):
+    """¿Es dueño de Sportink? (para enseñar el panel de plataforma en el menú)."""
+    return {"plataforma": await is_platform_admin(user)}
+
+
+def _monthly_amount(plan: Optional[str], interval: Optional[str], prices: dict) -> float:
+    """Ingreso mensual aproximado de una suscripción (precio de Stripe o de referencia, sin descuentos)."""
+    if plan not in PLANS:
+        return 0.0
+    interval = interval if interval in ("month", "year") else "month"
+    amount = (prices.get((plan, interval)) or {}).get("importe")
+    if amount is None:
+        amount = PLANS[plan]["precio_ref"][interval]
+    return round(amount / 12, 2) if interval == "year" else float(amount)
+
+
+def _admin_clubs_sync() -> list[dict]:
+    from players_store import TEMPORADA
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+            select c.id::text, c.nombre, c.slug, c.created_at, c.is_default,
+                   s.plan, s.status, s.comped, s.trial_ends_at, s.current_period_end, s.billing_interval,
+                   s.cancel_at_period_end, s.stripe_customer_id, s.stripe_subscription_id, s.notes, s.created_at,
+                   (select count(*) from public.teams t where t.club_id = c.id and t.activo and t.temporada = %s),
+                   (select count(*) from public.players p where p.club_id = c.id and p.temporada = %s),
+                   (select string_agg(distinct lower(pr.email), ', ') from public.profiles pr
+                      where pr.club_id = c.id and pr.rol = 'admin' and coalesce(pr.email, '') <> '')
+            from public.clubs c
+            left join public.club_subscriptions s on s.club_id = c.id
+            order by c.created_at desc nulls last, c.nombre
+        """, (TEMPORADA, TEMPORADA))
+        cols = ["club_id", "nombre", "slug", "club_creado", "por_defecto", "plan", "status", "comped", "trial_ends_at",
+                "current_period_end", "billing_interval", "cancel_at_period_end", "stripe_customer_id",
+                "stripe_subscription_id", "notes", "sub_creada", "equipos", "jugadores", "admins"]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def _admin_row(r: dict, prices: dict, now: datetime) -> dict:
+    has_sub = r.get("status") is not None
+    acc = compute_access(r, now) if has_sub else None
+    paid = bool(r.get("stripe_subscription_id")) and not r.get("comped")
+    if not has_sub:
+        estado = "sin_empezar"
+    elif r.get("comped"):
+        estado = "gratis"
+    elif acc["motivo"] == "trial":
+        estado = "prueba"
+    elif acc["nivel"] != "full":
+        estado = "impago" if r["status"] in ("past_due", "unpaid", "incomplete") else (
+            "caducada" if acc["motivo"] == "trial_expired" else "cancelada")
+    elif r["status"] in ("past_due", "incomplete"):
+        estado = "impago"
+    else:
+        estado = "pagando"
+    mrr = _monthly_amount(r.get("plan"), r.get("billing_interval"), prices) \
+        if paid and r.get("status") in ("active", "past_due", "trialing") else 0.0
+    stripe_url = None
+    if r.get("stripe_customer_id"):
+        test = _env("STRIPE_SECRET_KEY").startswith("sk_test")
+        stripe_url = f"https://dashboard.stripe.com/{'test/' if test else ''}customers/{r['stripe_customer_id']}"
+    return {
+        "club_id": r["club_id"], "nombre": r["nombre"], "slug": r["slug"],
+        "alta": _iso(r.get("club_creado")), "admins": r.get("admins") or "",
+        "estado": estado, "estado_stripe": r.get("status"),
+        "plan": r.get("plan"), "plan_nombre": PLANS.get(r.get("plan") or "", {}).get("nombre"),
+        "intervalo": r.get("billing_interval"),
+        "dias_prueba": (acc or {}).get("dias_prueba"),
+        "prueba_hasta": _iso(r.get("trial_ends_at")), "renueva_el": _iso(r.get("current_period_end")),
+        "cancela_al_final": bool(r.get("cancel_at_period_end")),
+        "gratis": bool(r.get("comped")), "pagando": paid, "ingreso_mensual": mrr,
+        "uso": {"equipos": int(r.get("equipos") or 0), "jugadores": int(r.get("jugadores") or 0)},
+        "limites": (acc or {}).get("limites"), "notas": r.get("notes") or "",
+        "stripe_url": stripe_url,
+    }
+
+
 @router.get("/billing/admin/clubs")
 async def admin_list_clubs(user=Depends(require_platform_admin)):
-    def run():
-        with _connect() as conn, conn.cursor() as cur:
-            cur.execute("select c.id::text, c.nombre, c.slug, s.plan, s.status, s.comped, s.trial_ends_at, "
-                        "s.current_period_end, s.billing_interval, s.stripe_customer_id "
-                        "from public.clubs c left join public.club_subscriptions s on s.club_id = c.id order by c.nombre")
-            cols = ["club_id", "nombre", "slug", "plan", "estado", "gratis", "prueba_hasta", "renueva_el", "intervalo", "stripe_customer_id"]
-            return [{k: (_iso(v) if isinstance(v, datetime) else v) for k, v in zip(cols, r)} for r in cur.fetchall()]
-    return await _io(run)
+    """Panel de Sportink: todos los clubes, su estado, lo que pagan y los resúmenes."""
+    rows, prices = await asyncio.gather(_io(_admin_clubs_sync), _io(_prices_sync))
+    now = _now()
+    clubs = [_admin_row(r, prices, now) for r in rows]
+    by = lambda e: [c for c in clubs if c["estado"] == e]  # noqa: E731
+    en_prueba = by("prueba")
+    resumen = {
+        "clubes": len(clubs),
+        "ingreso_mensual": round(sum(c["ingreso_mensual"] for c in clubs), 2),
+        "ingreso_anual": round(sum(c["ingreso_mensual"] for c in clubs) * 12, 2),
+        "pagando": len(by("pagando")) + len([c for c in by("impago") if c["pagando"]]),
+        "en_prueba": len(en_prueba),
+        "pruebas_7_dias": len([c for c in en_prueba if (c["dias_prueba"] or 99) <= 7]),
+        "impago": len(by("impago")),
+        "caducadas": len(by("caducada")) + len(by("cancelada")),
+        "gratis": len(by("gratis")),
+        "jugadores": sum(c["uso"]["jugadores"] for c in clubs),
+        "por_plan": {k: len([c for c in clubs if c["pagando"] and c["plan"] == k]) for k in PLANS},
+        "precios_de_referencia": not bool(prices),
+    }
+    return {"resumen": resumen, "clubes": clubs}
 
 
 @router.put("/billing/admin/clubs/{club_id}")
@@ -1060,6 +1173,10 @@ async def admin_update_club(club_id: str, data: AdminClubIn, user=Depends(requir
     changes: dict = {}
     if data.comped is not None:
         changes["comped"] = data.comped
+        if data.comped is False and not sub.get("stripe_subscription_id"):
+            # Sin regalo y sin suscripción: 7 días para elegir plan (no se corta de golpe).
+            changes["status"] = "trialing"
+            changes["trial_ends_at"] = _now() + timedelta(days=7)
     if data.plan:
         changes["plan"] = data.plan
     if data.notes is not None:

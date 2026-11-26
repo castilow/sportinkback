@@ -156,7 +156,8 @@ class FakeStripe:
 
         class Prices:
             def retrieve(self, pid, params=None, options=None):
-                return {"id": pid, "unit_amount": 4900, "currency": "eur"}
+                amounts = {"price_club_y": 99000, "price_club_m": 9900, "price_premium_m": 17900, "price_basico_y": 49000}
+                return {"id": pid, "unit_amount": amounts.get(pid, 4900), "currency": "eur"}
 
         self.v1 = SimpleNamespace(subscriptions=Subs(), customers=Customers(),
                                   checkout=SimpleNamespace(sessions=Sessions()),
@@ -187,6 +188,7 @@ def env(monkeypatch):
     fake.club = club
     monkeypatch.setattr(billing, "_client", lambda: fake)
     billing._invalidate()
+    billing._PRICE_CACHE.update(t=0.0, data={})
     user = {"id": "u-admin", "role": "admin", "club_id": club, "email": "dir@prueba.test", "name": "Dir"}
     app = FastAPI()
 
@@ -437,3 +439,46 @@ def test_plan_elegido_en_la_web(env):
     d = call(env, "GET", "/api/billing/me").json()
     assert d["plan_interes"] == "club"
     sql(env, "delete from public.public_registrations where club_id = %s", env.club)
+
+
+def test_panel_de_plataforma(env, monkeypatch):
+    monkeypatch.setenv("PLATFORM_ADMIN_EMAILS", "dir@prueba.test")
+    assert call(env, "GET", "/api/billing/admin/me").json() == {"plataforma": True}
+    call(env, "GET", "/api/billing/me")
+    billing.apply_subscription_sync(env.club, stripe_sub(price="price_club_y", club=env.club))
+    d = call(env, "GET", "/api/billing/admin/clubs").json()
+    mine = [c for c in d["clubes"] if c["club_id"] == env.club][0]
+    assert mine["estado"] == "pagando" and mine["plan"] == "club" and mine["ingreso_mensual"] == 82.5   # 990 / 12
+    assert d["resumen"]["ingreso_mensual"] >= 82.5 and d["resumen"]["pagando"] >= 1
+    rayo = [c for c in d["clubes"] if c["gratis"]]
+    assert rayo and rayo[0]["ingreso_mensual"] == 0
+    # Regalar y quitar el regalo
+    r = call(env, "PUT", f"/api/billing/admin/clubs/{env.club}", json={"comped": True, "plan": "premium", "notes": "Piloto"})
+    assert r.status_code == 200 and r.json()["gratis"] is True and r.json()["plan"] == "premium"
+    # Sin permiso: 404 (no revela que existe)
+    monkeypatch.setenv("PLATFORM_ADMIN_EMAILS", "otro@sportink.test")
+    assert call(env, "GET", "/api/billing/admin/clubs").status_code == 404
+    assert call(env, "GET", "/api/billing/admin/me").json() == {"plataforma": False}
+
+
+def test_quitar_regalo_sin_suscripcion_da_7_dias(env, monkeypatch):
+    monkeypatch.setenv("PLATFORM_ADMIN_EMAILS", "dir@prueba.test")
+    call(env, "GET", "/api/billing/me")
+    call(env, "PUT", f"/api/billing/admin/clubs/{env.club}", json={"comped": True})
+    r = call(env, "PUT", f"/api/billing/admin/clubs/{env.club}", json={"comped": False}).json()
+    assert r["gratis"] is False and r["estado"] == "trialing" and r["acceso"]["dias_prueba"] == 7
+
+
+
+def test_duenos_de_plataforma_desde_la_tabla(env, monkeypatch):
+    monkeypatch.delenv("PLATFORM_ADMIN_EMAILS", raising=False)
+    billing._PLATFORM_CACHE.update(t=0.0, emails=set())
+    assert call(env, "GET", "/api/billing/admin/me").json() == {"plataforma": False}
+    sql(env, "insert into public.platform_admins (email, nombre) values ('dir@prueba.test', 'Dir') on conflict do nothing")
+    billing._PLATFORM_CACHE.update(t=0.0, emails=set())
+    try:
+        assert call(env, "GET", "/api/billing/admin/me").json() == {"plataforma": True}
+        assert call(env, "GET", "/api/billing/admin/clubs").status_code == 200
+    finally:
+        sql(env, "delete from public.platform_admins where email = 'dir@prueba.test'")
+        billing._PLATFORM_CACHE.update(t=0.0, emails=set())
