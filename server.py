@@ -2384,6 +2384,7 @@ from routes import users as _users_routes  # noqa: E402
 from routes import stock as _stock_routes  # noqa: E402
 from routes import caja as _caja_routes  # noqa: E402
 from routes import billing as _billing_routes  # noqa: E402
+from routes import verifactu as _verifactu_routes  # noqa: E402
 # Chat interno retirado (Klink lo sustituirá): sin filtro de club, no se monta.
 # api_router.include_router(_chat_routes.router)
 api_router.include_router(_sheets_routes.router)
@@ -2395,6 +2396,7 @@ api_router.include_router(_users_routes.router)
 api_router.include_router(_stock_routes.router)
 api_router.include_router(_caja_routes.router)
 api_router.include_router(_billing_routes.router)
+api_router.include_router(_verifactu_routes.router)
 
 
 
@@ -2998,6 +3000,7 @@ async def _startup():
     init_storage()
     try:
         _billing_routes.start_background_tasks()  # emails de prueba/pago (si hay SMTP)
+        _verifactu_routes.start_background_tasks()  # reintentos de envíos a la AEAT
     except Exception as exc:
         logger.warning("Tareas de facturación no arrancadas: %s", exc)
     await backfill_player_entities()

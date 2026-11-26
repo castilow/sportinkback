@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field, field_validator
 from postgres_compat import PostgresCompatDB
 from deps import db, now_iso, uuid, MAX_UPLOAD_BYTES, require_roles, require_club_context
 
+from routes import verifactu  # noqa: E402
 router = APIRouter()
 
 CAJA_ROLES = ("admin", "office")
@@ -348,6 +349,9 @@ class MovimientoIn(BaseModel):
     entregado: Optional[float] = Field(default=None, ge=0, le=100000)  # lo que da la familia en efectivo
     nota: str = Field(default="", max_length=500)
     prendas: List[PrendaIn] = Field(default_factory=list, max_length=100)
+    # Factura completa (VeriFactu F1): datos fiscales del cliente; si no, simplificada (F2).
+    factura_nif: str = Field(default="", max_length=20)
+    factura_nombre: str = Field(default="", max_length=120)
 
     @field_validator("fecha")
     @classmethod
@@ -410,6 +414,7 @@ class EntidadCfg(BaseModel):
     direccion: str = Field(default="", max_length=200)
     serie: str = Field(min_length=1, max_length=6)
     exenta_iva: bool = False
+    verifactu: bool = False  # sus cobros se registran como facturas en la AEAT (VeriFactu)
 
     @field_validator("serie")
     @classmethod
@@ -593,10 +598,20 @@ async def create_movimiento(data: MovimientoIn, user=Depends(require_roles(*CAJA
             doc["stock_movement_id"] = mov["id"]
             doc["prendas"] = [{"product_id": i["product_id"], "ean": i["ean"], "name": i["name"],
                                "size": i["size"], "qty": i["qty"]} for i in items]
+        if data.tipo == "ingreso" and entidad:
+            vf = verifactu.prepare(doc, cfg["entidades"].get(entidad) or {}, data.factura_nif, data.factura_nombre)
+            if vf:
+                doc["verifactu"] = vf
         _insert(cur, "caja_movimientos", doc)
         return _public(doc)
 
-    return await _write(club_id, apply, with_stock_lock=bool(data.prendas))
+    result = await _write(club_id, apply, with_stock_lock=bool(data.prendas))
+    if result.get("verifactu"):
+        # El cobro ya está guardado; el envío a la AEAT no puede hacer que se pierda.
+        sent = await verifactu.send_alta(club_id, result["id"])
+        if sent:
+            result["verifactu"] = {**result["verifactu"], **sent}
+    return result
 
 
 @router.get("/caja/movimientos")
@@ -657,6 +672,8 @@ async def update_movimiento(mov_id: str, data: MovimientoUpdateIn, user=Depends(
         if m.get("estado") == "anulado":
             raise HTTPException(status_code=409, detail="Un movimiento anulado no se puede editar")
         _check_open(cur, club_id, m["fecha"])
+        if m.get("verifactu") and data.importe is not None and _cents(data.importe) != int(m["importe_c"]):
+            raise HTTPException(status_code=409, detail="Este cobro es una factura VeriFactu: para cambiar el importe, anúlalo y cóbralo de nuevo.")
         changes, log = {}, {}
         for k in ("nombre", "player_id", "player_team", "nota", "descripcion"):
             v = getattr(data, k)
@@ -708,6 +725,13 @@ async def anular_movimiento(mov_id: str, data: AnularIn, user=Depends(require_ro
         _check_open(cur, club_id, m["fecha"])
         changes = {"estado": "anulado", "anulacion": {"motivo": data.motivo.strip(), "por": user.get("name", ""),
                                                        "at": now_iso()}, "updated_at": now_iso()}
+        if m.get("verifactu"):
+            vf = dict(m["verifactu"])
+            if vf.get("estado") in ("enviada", "correcto"):
+                vf["anulacion_pendiente"] = True   # hay que anularla también en la AEAT
+            else:
+                vf["estado"] = "no_enviada"         # nunca llegó a Hacienda: no hay nada que anular
+            changes["verifactu"] = vf
         if m.get("prendas"):
             mov, _ = _apply_stock_out(cur, club_id, m["prendas"], m["numero"], user, m.get("nombre", ""),
                                       m.get("player_id", ""), reverse=True)
