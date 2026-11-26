@@ -222,8 +222,27 @@ def _get_or_create_sync(club_id: str) -> dict:
                 "insert into public.club_subscriptions (club_id, plan, status, trial_ends_at) "
                 "values (%s::uuid, 'premium', 'trialing', now() + make_interval(days => %s)) on conflict (club_id) do nothing",
                 (club_id, _trial_days()))
+            created = cur.rowcount == 1
         cur.execute(_SELECT + " where club_id = %s::uuid", (club_id,))
-        return _row(cur)
+        row = _row(cur)
+    if not club[0] and created:
+        _after_trial_created(club_id)
+    return row
+
+
+def _after_trial_created(club_id: str):
+    """Club nuevo en prueba: guarda el plan que eligió en la web y le da la bienvenida."""
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute("select payload->>'plan_interes' from public.public_registrations "
+                        "where club_id = %s::uuid order by created_at desc limit 1", (club_id,))
+            r = cur.fetchone()
+            if r and r[0] in PLANS:
+                cur.execute("update public.club_subscriptions set plan_interes = %s where club_id = %s::uuid", (r[0], club_id))
+    except Exception as exc:
+        logger.info("Plan elegido en el registro no disponible para %s: %s", club_id, exc)
+    import threading
+    threading.Thread(target=send_billing_email_safe, args=(club_id, "bienvenida"), daemon=True).start()
 
 
 def _update_sync(club_id: str, changes: dict) -> dict:
@@ -497,6 +516,8 @@ def handle_event_sync(event: dict) -> str:
         if not club_id:
             return "sin club"
         apply_subscription_sync(club_id, sub)
+        if etype == "invoice.payment_failed":
+            send_billing_email_safe(club_id, f"pago_fallido:{obj.get('id') or event.get('id')}", invoice=obj)
         return "aplicado"
     return "ignorado"
 
@@ -518,6 +539,7 @@ def _sub_out(sub: dict, acc: dict, usage: Optional[dict] = None) -> dict:
         "uso": usage,
         "cobros_activos": _enforced(),
         "pagos_configurados": bool(_env("STRIPE_SECRET_KEY")),
+        "plan_interes": sub.get("plan_interes"),
     }
 
 
@@ -570,7 +592,7 @@ async def my_subscription(user=Depends(get_current_user)):
     _invalidate(club_id)
     sub, acc = await get_subscription(club_id)
     usage = await _io(_usage_sync, club_id)
-    out = _sub_out(sub, acc, usage)
+    out = _sub_out({**sub, "plan_interes": await _io(_plan_interes_sync, club_id)}, acc, usage)
     out["puede_gestionar"] = user.get("role") == "admin"
     return out
 
@@ -606,6 +628,12 @@ async def create_checkout(data: CheckoutIn, request: Request, user=Depends(requi
         raise HTTPException(status_code=409, detail="Este club no paga cuota de plataforma")
     if sub.get("stripe_subscription_id") and sub.get("status") in FULL_STATUSES:
         raise HTTPException(status_code=409, detail="Ya tienes una suscripción. Para cambiar de plan usa «Gestionar suscripción».")
+    over = _over_limits(data.plan, await _io(_usage_sync, club_id))
+    if over:
+        raise HTTPException(status_code=409, detail={
+            "code": "downgrade_over_limit",
+            "message": "Este plan se te queda corto: " + "; ".join(over) + ". Elige un plan mayor.",
+        })
     base = _frontend_base(request)
     customer_id = await _io(_ensure_customer_sync, club_id, user)
 
@@ -714,6 +742,285 @@ async def stripe_webhook(request: Request):
         raise HTTPException(status_code=500, detail="Error procesando el evento")
     logger.info("Stripe webhook %s %s → %s", event_id, etype, result)
     return {"received": True, "resultado": result}
+
+
+def _plan_interes_sync(club_id: str) -> Optional[str]:
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute("select plan_interes from public.club_subscriptions where club_id = %s::uuid", (club_id,))
+            r = cur.fetchone()
+            return r[0] if r else None
+    except Exception:
+        return None  # migración de emails aún no aplicada
+
+
+# ------------------------------------------------------------------ capacidad (importaciones)
+KIND_LABEL = {"jugadores": ("jugador", "jugadores"), "equipos": ("equipo", "equipos")}
+
+
+async def capacity_info(club_id: Optional[str], kind: str, adding: int) -> Optional[dict]:
+    """¿Caben `adding` jugadores/equipos más en el plan? None si no hay límite."""
+    if not _enforced() or not club_id or adding <= 0:
+        return None
+    try:
+        sub, acc = await get_subscription(club_id)
+    except Exception:
+        return None
+    cap = acc["limites"].get(kind)
+    if cap is None:
+        return None
+    usage = (await _io(_usage_sync, club_id))[kind]
+    libre = max(0, cap - usage)
+    ok = usage + adding <= cap
+    one, many = KIND_LABEL.get(kind, (kind, kind))
+    msg = None if ok else (
+        f"Este archivo añade {adding} {one if adding == 1 else many} y tu plan {PLANS[acc['plan']]['nombre']} "
+        f"permite {cap} (ya tienes {usage}). Mejora el plan o importa como máximo {libre}."
+    )
+    return {"permitido": ok, "tipo": kind, "uso": usage, "maximo": cap, "nuevos": adding, "libre": libre,
+            "plan": acc["plan"], "mensaje": msg}
+
+
+async def ensure_capacity(user: dict, kind: str, adding: int):
+    info = await capacity_info(user.get("club_id"), kind, adding)
+    if info and not info["permitido"]:
+        _payment_required("plan_limit_reached", info["mensaje"], limite=kind, maximo=info["maximo"],
+                          uso=info["uso"], nuevos=adding)
+
+
+# ------------------------------------------------------------------ cambio de plan (con control de bajada)
+class ChangePlanIn(BaseModel):
+    plan: Literal["basico", "club", "premium"]
+    intervalo: Literal["month", "year"] = "month"
+
+
+def _over_limits(plan: str, usage: dict) -> list[str]:
+    out = []
+    for kind, cap in PLANS[plan]["limites"].items():
+        if cap is not None and usage.get(kind, 0) > cap:
+            out.append(f"tienes {usage[kind]} {kind} y el plan {PLANS[plan]['nombre']} permite {cap}")
+    return out
+
+
+@router.post("/billing/change-plan")
+async def change_plan(data: ChangePlanIn, user=Depends(require_roles("admin"))):
+    """Subir o bajar de plan (o pasar a anual) sin salir de Sportink.
+    Antes de bajar, comprueba que el club cabe en el plan nuevo."""
+    club_id = require_club_context(user)
+    sub = await _io(_get_or_create_sync, club_id)
+    if not sub.get("stripe_subscription_id") or sub.get("status") not in FULL_STATUSES:
+        raise HTTPException(status_code=409, detail="No tienes una suscripción activa: elige un plan para empezar.")
+    price = _price_id(data.plan, data.intervalo)
+    if not price:
+        raise HTTPException(status_code=400, detail="Ese plan todavía no tiene precio configurado en Stripe")
+    if price == sub.get("stripe_price_id"):
+        raise HTTPException(status_code=409, detail="Ya tienes este plan.")
+    usage = await _io(_usage_sync, club_id)
+    over = _over_limits(data.plan, usage)
+    if over:
+        raise HTTPException(status_code=409, detail={
+            "code": "downgrade_over_limit",
+            "message": "No puedes pasar a este plan: " + "; ".join(over) + ". Da de baja lo que sobra o elige un plan mayor.",
+            "uso": usage, "limites": PLANS[data.plan]["limites"],
+        })
+
+    def run():
+        client = _client()
+        current = _plain(client.v1.subscriptions.retrieve(sub["stripe_subscription_id"]))
+        items = ((current.get("items") or {}).get("data")) or []
+        if not items:
+            raise HTTPException(status_code=409, detail="La suscripción no tiene ningún concepto que cambiar")
+        updated = _plain(client.v1.subscriptions.update(sub["stripe_subscription_id"], params={
+            "items": [{"id": items[0]["id"], "price": price}],
+            "proration_behavior": "create_prorations",
+            "metadata": {"club_id": club_id, "plan": data.plan},
+        }))
+        updated.setdefault("metadata", {}).setdefault("club_id", club_id)
+        return apply_subscription_sync(club_id, updated)
+
+    try:
+        row = await _io(run)
+    except stripe.StripeError as exc:
+        logger.error("Stripe cambio de plan falló (club %s): %s", club_id, exc)
+        raise HTTPException(status_code=502, detail="No se pudo cambiar el plan en Stripe. Inténtalo de nuevo.")
+    _invalidate(club_id)
+    logger.info("Club %s cambia a %s/%s", club_id, data.plan, data.intervalo)
+    return _sub_out(row, compute_access(row), usage)
+
+
+# ------------------------------------------------------------------ emails automáticos
+def _admin_emails_sync(club_id: str) -> list[str]:
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute("select distinct lower(email) from public.profiles where club_id = %s::uuid and rol = 'admin' "
+                    "and email is not null and email <> ''", (club_id,))
+        return [r[0] for r in cur.fetchall()]
+
+
+def _claim_email_sync(club_id: str, key: str) -> bool:
+    """Marca el email como enviado; False si ya lo estaba (evita duplicados entre procesos)."""
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute("update public.club_subscriptions set emails_enviados = emails_enviados || jsonb_build_object(%s::text, now()) "
+                    "where club_id = %s::uuid and not (emails_enviados ? %s::text)", (key, club_id, key))
+        return cur.rowcount == 1
+
+
+def _unclaim_email_sync(club_id: str, key: str):
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute("update public.club_subscriptions set emails_enviados = emails_enviados - %s::text where club_id = %s::uuid",
+                    (key, club_id))
+
+
+def _email_html(title: str, paragraphs: list[str], cta: Optional[tuple[str, str]], club: str) -> str:
+    import html as _h
+    body = "".join(f'<p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:#334155">{p}</p>' for p in paragraphs)
+    button = (f'<a href="{_h.escape(cta[1])}" style="display:inline-block;background:#1d4ed8;color:#ffffff;text-decoration:none;'
+              f'font-weight:600;font-size:15px;padding:12px 22px;border-radius:10px">{_h.escape(cta[0])}</a>') if cta else ""
+    return f"""<!doctype html><html><body style="margin:0;background:#f1f5f9;font-family:Inter,Segoe UI,Arial,sans-serif">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:28px 12px"><tr><td align="center">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border-radius:16px;overflow:hidden;border:1px solid #e2e8f0">
+<tr><td style="background:#0a1f4d;padding:22px 28px;color:#ffffff;font-size:20px;font-weight:800;letter-spacing:-.3px">Sportink<span style="color:#60a5fa">.</span>
+<div style="font-size:12px;font-weight:500;color:#93c5fd;letter-spacing:.12em;text-transform:uppercase;margin-top:2px">{_h.escape(club)}</div></td></tr>
+<tr><td style="padding:28px">
+<h1 style="margin:0 0 16px;font-size:22px;line-height:1.3;color:#0a1f4d">{title}</h1>{body}
+<div style="margin-top:22px">{button}</div></td></tr>
+<tr><td style="padding:16px 28px;border-top:1px solid #e2e8f0;font-size:12px;color:#94a3b8">Recibes este correo porque eres de Dirección en Sportink. ¿Dudas? Responde a este email.</td></tr>
+</table></td></tr></table></body></html>"""
+
+
+def _build_email(kind: str, club: str, sub: dict, base: str, invoice: Optional[dict] = None) -> tuple[str, str, str]:
+    plan_url = f"{base}/plan" if base else "/plan"
+    import html as _h
+    c = _h.escape(club or "tu club")
+    trial_end = sub.get("trial_ends_at")
+    fecha = trial_end.astimezone(timezone.utc).strftime("%d/%m/%Y") if trial_end else ""
+    interes = sub.get("plan_interes")
+    plan_line = f"Cuando quieras, activa el plan <b>{PLANS[interes]['nombre']}</b> que elegiste en la web." if interes in PLANS else \
+        "Cuando quieras, elige el plan que mejor encaje con tu club."
+    if kind == "bienvenida":
+        title = f"¡Bienvenido a Sportink, {c}!"
+        paras = [f"Ya tienes <b>{_trial_days()} días de prueba con todo incluido</b> (hasta el {fecha}), sin tarjeta.",
+                 "Para empezar en 10 minutos: importa tus jugadores desde Excel, invita a tus entrenadores en «Usuarios» "
+                 "y prueba la hoja de partido desde el móvil.", plan_line]
+        cta = ("Entrar en Sportink", base or plan_url)
+        subject = "Bienvenido a Sportink: tu prueba de 30 días ha empezado"
+    elif kind == "prueba_7":
+        title = "Te queda una semana de prueba"
+        paras = [f"La prueba de {c} termina el <b>{fecha}</b>.", plan_line,
+                 "Si no eliges plan, no se borra nada: el club quedará en modo consulta hasta que lo actives."]
+        cta = ("Ver planes", plan_url)
+        subject = "Tu prueba de Sportink termina en 7 días"
+    elif kind == "prueba_3":
+        title = "Quedan 3 días de prueba"
+        paras = [f"El {fecha} termina la prueba de {c}. Elige un plan para seguir trabajando sin cortes.", plan_line]
+        cta = ("Elegir plan", plan_url)
+        subject = "Quedan 3 días de tu prueba de Sportink"
+    elif kind == "prueba_fin":
+        title = "Tu prueba ha terminado"
+        paras = [f"{c} está ahora en <b>modo consulta</b>: podéis ver y exportar todo, pero no crear ni modificar.",
+                 "Todos vuestros datos siguen ahí. Activa un plan y volvéis a trabajar al momento."]
+        cta = ("Activar un plan", plan_url)
+        subject = "Tu prueba de Sportink ha terminado"
+    else:  # pago_fallido
+        amount = ""
+        if invoice and invoice.get("amount_due"):
+            amount = f" de {invoice['amount_due'] / 100:.2f} €".replace(".", ",")
+        title = "No hemos podido cobrar tu suscripción"
+        paras = [f"El cobro{amount} de la suscripción de {c} ha fallado. Stripe lo reintentará en los próximos días.",
+                 f"Para evitar cortes, revisa o cambia el método de pago. Si en {_grace_days()} días sigue pendiente, "
+                 "el club pasará a modo consulta (sin borrar nada)."]
+        cta = ("Actualizar método de pago", plan_url)
+        subject = "Problema con el cobro de tu suscripción a Sportink"
+    import re as _re
+    text = "\n\n".join(_re.sub(r"<[^>]+>", "", p) for p in [title, *paras]) + (f"\n\n{cta[0]}: {cta[1]}" if cta else "")
+    return subject, _email_html(title, paras, cta, club or "Sportink"), text
+
+
+def send_billing_email_sync(club_id: str, key: str, invoice: Optional[dict] = None) -> bool:
+    import mailer
+    kind = key.split(":")[0]
+    if not mailer.configured():
+        logger.info("Email %s para %s no enviado: falta configurar SMTP", kind, club_id)
+        return False
+    to = _admin_emails_sync(club_id)
+    if not to:
+        return False
+    if not _claim_email_sync(club_id, key):
+        return False
+    sub = _get_or_create_sync(club_id)
+    sub["plan_interes"] = _plan_interes_sync(club_id)
+    club = _club_info_sync(club_id).get("nombre") or ""
+    try:
+        base = _frontend_base(None)
+    except HTTPException:
+        base = ""
+    subject, html, text = _build_email(kind, club, sub, base, invoice)
+    ok = mailer.send_email(to, subject, html, text)
+    if not ok:
+        _unclaim_email_sync(club_id, key)  # se reintentará en la siguiente pasada
+    return ok
+
+
+def send_billing_email_safe(club_id: str, key: str, invoice: Optional[dict] = None) -> bool:
+    try:
+        return send_billing_email_sync(club_id, key, invoice)
+    except Exception as exc:
+        logger.warning("Email %s de %s falló: %s", key, club_id, exc)
+        return False
+
+
+def run_billing_emails_sync() -> dict:
+    """Pasada periódica: recordatorios de fin de prueba (y bienvenidas pendientes)."""
+    import mailer
+    if not mailer.configured():
+        return {"enviados": 0, "motivo": "smtp_no_configurado"}
+    sent = {}
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+            select club_id::text,
+              case
+                when trial_ends_at > now() + interval '3 days' and trial_ends_at <= now() + interval '7 days' then 'prueba_7'
+                when trial_ends_at > now() and trial_ends_at <= now() + interval '3 days' then 'prueba_3'
+                when trial_ends_at <= now() and trial_ends_at > now() - interval '7 days' then 'prueba_fin'
+                when created_at > now() - interval '3 days' then 'bienvenida'
+              end as kind
+            from public.club_subscriptions
+            where not comped and status = 'trialing' and stripe_subscription_id is null and trial_ends_at is not null
+        """)
+        rows = [(c, k) for c, k in cur.fetchall() if k]
+    for club_id, kind in rows:
+        # La bienvenida también vale si se perdió (p. ej. SMTP caído al crear el club).
+        if send_billing_email_safe(club_id, kind):
+            sent[kind] = sent.get(kind, 0) + 1
+    return {"enviados": sum(sent.values()), "detalle": sent}
+
+
+async def billing_email_loop():
+    """Cada hora. Arranca con el servidor si hay SMTP (BILLING_EMAILS=0 lo desactiva)."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            r = await _io(run_billing_emails_sync)
+            if r.get("enviados"):
+                logger.info("Emails de suscripción: %s", r)
+        except Exception as exc:
+            logger.warning("Pasada de emails de suscripción falló: %s", exc)
+        await asyncio.sleep(3600)
+
+
+def start_background_tasks():
+    import mailer
+    if _env("BILLING_EMAILS", "1").lower() in ("0", "false", "no", "off") or not mailer.configured():
+        return
+    asyncio.get_event_loop().create_task(billing_email_loop())
+
+
+@router.post("/billing/cron")
+async def billing_cron(request: Request):
+    """Para un cron externo (Render Cron, GitHub Actions): cabecera X-Cron-Secret = CRON_SECRET."""
+    secret = _env("CRON_SECRET")
+    if not secret or request.headers.get("x-cron-secret") != secret:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return await _io(run_billing_emails_sync)
 
 
 # ------------------------------------------------------------------ plataforma (dueños de Sportink)

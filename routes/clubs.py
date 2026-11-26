@@ -397,6 +397,18 @@ async def import_teams(file: UploadFile = File(...), user=Depends(require_roles(
         raise HTTPException(status_code=400, detail=f"Máximo {MAX_TEAM_IMPORT} equipos por archivo")
 
     sport_id = await _club_sport_id_for_import(club_id)
+    # Límites del plan: cuántos equipos NUEVOS trae el archivo.
+    from routes import billing as _billing
+    names_in_file = {(_cell(r[mapping["nombre"]]) or "")[:120].strip().lower() for _, r in df.iterrows()} - {""}
+    try:
+        existing = await _sql_rows(
+            f"select json_build_object('n', lower(nombre))::text from public.teams "
+            f"where club_id = {_sql_literal(club_id)}::uuid and temporada = {_sql_literal(TEMPORADA)};"
+        )
+        existing_names = {r.get("n") for r in existing}
+    except Exception:
+        existing_names = set()
+    await _billing.ensure_capacity(user, "equipos", len(names_in_file - existing_names))
     created, skipped, errors = [], [], []
     seen = set()
     for idx, row in df.iterrows():

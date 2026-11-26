@@ -128,6 +128,14 @@ class FakeStripe:
                 outer.calls.append(("sub.retrieve", sub_id))
                 return outer.subs[sub_id]
 
+            def update(self, sub_id, params=None, options=None):
+                outer.calls.append(("sub.update", sub_id, params))
+                sub = json.loads(json.dumps(outer.subs[sub_id]))
+                sub["items"]["data"][0]["price"] = {"id": params["items"][0]["price"], "recurring": {"interval": "month"}}
+                sub["metadata"].update(params.get("metadata") or {})
+                outer.subs[sub_id] = sub
+                return sub
+
         class Customers:
             def create(self, params=None, options=None):
                 outer.calls.append(("customer.create", params, options))
@@ -326,3 +334,106 @@ def test_sync_tras_volver_de_stripe(env):
     env.fake.subs["sub_1"] = stripe_sub(club=env.club, price="price_premium_m")
     r = call(env, "POST", "/api/billing/sync", params={"session_id": "cs_1"})
     assert r.status_code == 200 and r.json()["plan"] == "premium" and r.json()["estado"] == "active"
+
+
+
+# ---------------------------------------------------------------- mejoras: importaciones, cambio de plan, emails, plan elegido
+def add_teams(s, n):
+    from players_store import TEMPORADA
+    with psycopg.connect(s.dsn) as conn:
+        sport = conn.execute("select id from public.sports limit 1").fetchone()[0]
+        for i in range(n):
+            conn.execute("insert into public.teams (club_id, sport_id, nombre, categoria, temporada, activo) values (%s, %s, %s, 'Alevín', %s, true)",
+                         (s.club, sport, f"Eq {uuid.uuid4().hex[:6]}", TEMPORADA))
+
+
+def test_importar_cuenta_lo_que_trae_el_archivo(env):
+    call(env, "GET", "/api/billing/me")
+    billing.apply_subscription_sync(env.club, stripe_sub(price="price_basico_m", club=env.club))
+    add_teams(env, 8)
+    info = run(billing.capacity_info(env.club, "equipos", 3))
+    assert info["permitido"] is False and info["libre"] == 2 and "como máximo 2" in info["mensaje"]
+    assert run(billing.capacity_info(env.club, "equipos", 2))["permitido"] is True
+    with pytest.raises(HTTPException) as e:
+        run(billing.ensure_capacity(env.user, "equipos", 3))
+    assert e.value.status_code == 402 and e.value.detail["code"] == "plan_limit_reached"
+    run(billing.ensure_capacity(env.user, "jugadores", 150))          # justo en el límite: vale
+    with pytest.raises(HTTPException):
+        run(billing.ensure_capacity(env.user, "jugadores", 151))
+    sql(env, "delete from public.teams where club_id = %s", env.club)
+
+
+def test_cambiar_de_plan_y_no_bajar_si_no_cabe(env):
+    call(env, "GET", "/api/billing/me")
+    env.fake.subs["sub_1"] = stripe_sub(club=env.club, price="price_club_m")
+    env.fake.subs["sub_1"]["items"]["data"][0]["id"] = "si_1"
+    billing.apply_subscription_sync(env.club, env.fake.subs["sub_1"])
+    add_teams(env, 12)                                               # Básico permite 10
+    r = call(env, "POST", "/api/billing/change-plan", json={"plan": "basico", "intervalo": "month"})
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "downgrade_over_limit"
+    assert "12 equipos" in r.json()["detail"]["message"]
+    r = call(env, "POST", "/api/billing/change-plan", json={"plan": "premium", "intervalo": "month"})
+    assert r.status_code == 200 and r.json()["plan"] == "premium"
+    upd = [c for c in env.fake.calls if c[0] == "sub.update"][-1]
+    assert upd[2]["items"] == [{"id": "si_1", "price": "price_premium_m"}] and upd[2]["proration_behavior"] == "create_prorations"
+    assert call(env, "POST", "/api/billing/change-plan", json={"plan": "premium"}).status_code == 409   # ya lo tiene
+    sql(env, "delete from public.teams where club_id = %s", env.club)
+
+
+@pytest.fixture
+def mail(env, monkeypatch):
+    import mailer
+    uid = str(uuid.uuid4())
+    mine = f"dir-{uid[:6]}@club.test"
+    sent = []
+    # Solo los correos de ESTE club (la pasada periódica recorre todos los clubes de la BD).
+    monkeypatch.setattr(mailer, "configured", lambda: True)
+    monkeypatch.setattr(mailer, "send_email",
+                        lambda to, subject, html, text: (sent.append((to, subject, html, text)) if mine in to else None) or True)
+    with psycopg.connect(env.dsn) as conn:
+        conn.execute("insert into auth.users (id, email) values (%s, %s)", (uid, f"dir-{uid[:6]}@club.test"))
+        conn.execute("insert into public.profiles (id, email, nombre, rol, club_id) values (%s, %s, 'Dir', 'admin', %s)",
+                     (uid, f"dir-{uid[:6]}@club.test", env.club))
+    yield sent
+    with psycopg.connect(env.dsn) as conn:
+        conn.execute("delete from public.profiles where id = %s", (uid,))
+        conn.execute("delete from auth.users where id = %s", (uid,))
+
+
+def test_emails_de_prueba_sin_duplicados(env, mail):
+    billing._get_or_create_sync(env.club)
+    time.sleep(0.5)                                                  # la bienvenida sale en un hilo
+    assert [m[1] for m in mail] == ["Bienvenido a Sportink: tu prueba de 30 días ha empezado"]
+    assert "CD Prueba Pagos" in mail[0][2] and mail[0][0][0].endswith("@club.test")
+    sql(env, "update public.club_subscriptions set trial_ends_at = now() + interval '5 days' where club_id = %s", env.club)
+    billing.run_billing_emails_sync()
+    billing.run_billing_emails_sync()                                # segunda pasada: nada nuevo
+    sql(env, "update public.club_subscriptions set trial_ends_at = now() + interval '2 days' where club_id = %s", env.club)
+    billing.run_billing_emails_sync()
+    sql(env, "update public.club_subscriptions set trial_ends_at = now() - interval '1 hour' where club_id = %s", env.club)
+    billing.run_billing_emails_sync()
+    subjects = [m[1] for m in mail]
+    assert subjects[1:] == ["Tu prueba de Sportink termina en 7 días", "Quedan 3 días de tu prueba de Sportink",
+                            "Tu prueba de Sportink ha terminado"]
+    assert "/plan" in mail[-1][2] and "modo consulta" in mail[-1][3]
+
+
+def test_email_de_pago_fallido(env, mail):
+    billing._get_or_create_sync(env.club)
+    time.sleep(0.3)
+    mail.clear()
+    env.fake.subs["sub_9"] = stripe_sub(sub_id="sub_9", status="past_due", club=env.club)
+    body, headers = signed({"id": "evt_test_fail", "type": "invoice.payment_failed",
+                            "data": {"object": {"id": "in_1", "amount_due": 11979,
+                                                "parent": {"subscription_details": {"subscription": "sub_9"}}}}})
+    assert call(env, "POST", "/api/billing/webhook", content=body, headers=headers).status_code == 200
+    assert [m[1] for m in mail] == ["Problema con el cobro de tu suscripción a Sportink"] and "119,79 €" in mail[0][3]
+
+
+def test_plan_elegido_en_la_web(env):
+    sql(env, "insert into public.public_registrations (id, email, admin_name, payload, status, club_id) "
+             "values (gen_random_uuid(), %s, 'Ana', %s::jsonb, 'completed', %s)",
+        f"a-{env.club[:6]}@x.test", json.dumps({"plan_interes": "club"}), env.club)
+    d = call(env, "GET", "/api/billing/me").json()
+    assert d["plan_interes"] == "club"
+    sql(env, "delete from public.public_registrations where club_id = %s", env.club)

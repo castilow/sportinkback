@@ -128,6 +128,8 @@ class PublicRegistrationIn(BaseModel):
     # Opcional: el club puede crear o importar sus equipos después del alta.
     teams: List[TeamRegistrationIn] = Field(default_factory=list, max_length=MAX_TEAMS)
     players: List[PlayerRegistrationIn] = Field(default_factory=list, max_length=MAX_PLAYERS)
+    # Plan que eligió en la web (solo informativo: empieza siempre con la prueba completa).
+    plan: Optional[Literal["basico", "club", "premium"]] = None
 
     @field_validator("teams")
     @classmethod
@@ -159,6 +161,7 @@ def _build_payload(data: PublicRegistrationIn) -> dict:
             "slug": club_slug,
         },
         "sport": {"slug": sport_slug, "nombre": sport_name},
+        "plan_interes": data.plan,
         "teams": [
             {
                 "local_id": t.local_id,

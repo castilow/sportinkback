@@ -1295,6 +1295,11 @@ async def import_preview(file: UploadFile = File(...), user=Depends(require_role
         existing_teams = {}
     new_teams = sorted({r["team"] for r in rows if r["team"].strip().lower() not in existing_teams})
     categories = sorted({r["category"] for r in rows})
+    # Límites del plan: se avisa YA en la vista previa, antes de confirmar.
+    from routes import billing as _billing
+    limite_plan = await _billing.capacity_info(club_id_pv, "jugadores", len(rows))
+    if not (limite_plan and not limite_plan["permitido"]):
+        limite_plan = await _billing.capacity_info(club_id_pv, "equipos", len(new_teams)) or limite_plan
 
     batch_id = str(uuid.uuid4())
     await db.import_batches.insert_one({
@@ -1310,6 +1315,7 @@ async def import_preview(file: UploadFile = File(...), user=Depends(require_role
         "sample": rows[:8],
         "categories": categories,
         "new_teams": new_teams,
+        "limite_plan": limite_plan,
         "mapping": {k: str(v) for k, v in mapping.items()},
     }
 
@@ -1324,6 +1330,17 @@ async def import_commit(batch_id: str, user=Depends(require_roles("admin"))):
         raise HTTPException(status_code=400, detail="Lote ya importado")
     if batch.get("club_id") and batch.get("club_id") != club_id:
         raise HTTPException(status_code=403, detail="Ese lote pertenece a otro club")
+    # Límites del plan: cuenta lo que añade ESTE archivo, no solo lo que ya hay.
+    from routes import billing as _billing
+    await _billing.ensure_capacity(user, "jugadores", len(batch.get("rows") or []))
+    try:
+        _known = set((await _existing_team_map(club_id)).keys())
+        _new = {((r.get("team") or r.get("category") or "").strip().lower()) for r in batch.get("rows") or []} - _known - {""}
+        await _billing.ensure_capacity(user, "equipos", len(_new))
+    except HTTPException:
+        raise
+    except Exception:
+        pass
     import logging
     log = logging.getLogger("sportink.import")
     try:
@@ -2973,6 +2990,10 @@ async def _startup():
     await db.poll_votes.create_index([("poll_id", 1), ("voter_name", 1)])
     await db.chat_messages.create_index([("room_id", 1), ("created_at", 1)])
     init_storage()
+    try:
+        _billing_routes.start_background_tasks()  # emails de prueba/pago (si hay SMTP)
+    except Exception as exc:
+        logger.warning("Tareas de facturación no arrancadas: %s", exc)
     await backfill_player_entities()
     await backfill_player_club_ids()
     await backfill_user_club_ids()
